@@ -117,7 +117,9 @@ def _weaver_candidate_frontier_kernel(
             tl.where(child_valid, top_value - log_denom, -float("inf")),
         )
         tl.store(frontier_active_ptr + out_index, child_valid)
-        scores = tl.where(offsets == top_index, -float("inf"), scores)
+        # A proposal distribution has one mass per token. Remove every copy so
+        # malformed candidate pools cannot create duplicate sibling tokens.
+        scores = tl.where(token_ids == child_token, -float("inf"), scores)
 
 @triton.jit
 def _weaver_bitonic_step(
@@ -706,18 +708,137 @@ def _tree_metadata_parent_chain_kernel(
 
 
 @triton.jit
+def _weaver_target_only_verify_kernel(
+    candidates_ptr,
+    retrieve_index_ptr,
+    retrieve_next_token_ptr,
+    retrieve_next_sibling_ptr,
+    target_probs_ptr,
+    uniform_samples_ptr,
+    bonus_uniforms_ptr,
+    predicts_ptr,
+    accept_index_ptr,
+    accept_token_num_ptr,
+    NUM_NODES: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    batch = tl.program_id(0)
+    row_base = (batch * NUM_NODES).to(tl.int64)
+
+    current = tl.full((), 0, dtype=tl.int64)
+    target_row = row_base
+    last_accepted = tl.load(retrieve_index_ptr + row_base)
+    accepted = tl.full((), 0, dtype=tl.int32)
+    rejected_mass = tl.full((), 0.0, dtype=tl.float32)
+    coin = tl.load(uniform_samples_ptr + row_base)
+
+    tl.store(accept_index_ptr + row_base, last_accepted.to(tl.int32))
+    depth = tl.full((), 1, dtype=tl.int32)
+    done = tl.full((), False, dtype=tl.int1)
+    while (depth < NUM_NODES) & (~done):
+        child = tl.load(retrieve_next_token_ptr + row_base + current)
+        found = tl.full((), False, dtype=tl.int1)
+        while (child >= 0) & (~found):
+            child_token = tl.load(candidates_ptr + row_base + child)
+            child_prob = tl.load(
+                target_probs_ptr + target_row * VOCAB_SIZE + child_token
+            ).to(tl.float32)
+            rejected_mass += child_prob
+            found = coin <= rejected_mass
+
+            child_retrieve = tl.load(retrieve_index_ptr + row_base + child)
+            tl.store(
+                predicts_ptr + last_accepted,
+                child_token.to(tl.int32),
+                mask=found,
+            )
+            tl.store(
+                accept_index_ptr + row_base + accepted + 1,
+                child_retrieve.to(tl.int32),
+                mask=found,
+            )
+
+            # This row is private to verification and dead after this kernel.
+            # Removing rejected child mass in-place avoids a dense [B,T,V]
+            # draft-probability scratch tensor.
+            tl.store(
+                target_probs_ptr + target_row * VOCAB_SIZE + child_token,
+                0.0,
+                mask=~found,
+            )
+
+            accepted += found.to(tl.int32)
+            last_accepted = tl.where(found, child_retrieve, last_accepted)
+            current = tl.where(found, child, current)
+            target_row = tl.where(found, row_base + child, target_row)
+            coin = tl.where(
+                found,
+                tl.load(uniform_samples_ptr + row_base + child),
+                coin,
+            )
+            rejected_mass = tl.where(found, 0.0, rejected_mass)
+            child = tl.where(
+                found,
+                child,
+                tl.load(retrieve_next_sibling_ptr + row_base + child),
+            )
+
+        done = ~found
+        depth += 1
+
+    tl.store(accept_token_num_ptr + batch, accepted)
+
+    residual_mass = tl.maximum(1.0 - rejected_mass, 0.0)
+    threshold = tl.load(bonus_uniforms_ptr + batch) * residual_mass
+    sampled = tl.full((), VOCAB_SIZE, dtype=tl.int32)
+    last_positive = tl.full((), -1, dtype=tl.int32)
+    cumulative = tl.full((), 0.0, dtype=tl.float32)
+    vocab_block = tl.full((), 0, dtype=tl.int32)
+    num_vocab_blocks = tl.cdiv(VOCAB_SIZE, BLOCK_V)
+    while (vocab_block < num_vocab_blocks) & (sampled == VOCAB_SIZE):
+        offsets = vocab_block * BLOCK_V + tl.arange(0, BLOCK_V)
+        mask = offsets < VOCAB_SIZE
+        probs = tl.load(
+            target_probs_ptr + target_row * VOCAB_SIZE + offsets,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        cdf = cumulative + tl.cumsum(probs, axis=0)
+        hits = mask & (probs > 0.0) & (cdf >= threshold)
+        sampled = tl.minimum(
+            sampled,
+            tl.min(tl.where(hits, offsets, VOCAB_SIZE), axis=0).to(tl.int32),
+        )
+        last_positive = tl.maximum(
+            last_positive,
+            tl.max(tl.where(mask & (probs > 0.0), offsets, -1), axis=0).to(
+                tl.int32
+            ),
+        )
+        cumulative += tl.sum(probs, axis=0)
+        vocab_block += 1
+
+    sampled = tl.where(sampled < VOCAB_SIZE, sampled, last_positive)
+    tl.store(predicts_ptr + last_accepted, sampled)
+
+
+@triton.jit
 def _weaver_traversal_verify_kernel(
     candidates_ptr,
     parent_indices_ptr,
     depths_ptr,
     node_mask_ptr,
     draft_logprobs_ptr,
+    sibling_keys_ptr,
     target_probs_ptr,
     uniform_samples_ptr,
     predicts_ptr,
     accept_index_ptr,
     accept_token_num_ptr,
     accept_leaf_ptr,
+    final_target_child_probs_ptr,
+    final_target_tail_scale_ptr,
     NUM_NODES: tl.constexpr,
     VOCAB_SIZE: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -739,30 +860,81 @@ def _weaver_traversal_verify_kernel(
     )
 
     parents = tl.load(parent_indices_ptr + row_base + offsets, mask=col_mask, other=-1)
-    depths = tl.load(depths_ptr + row_base + offsets, mask=col_mask, other=0)
-    tokens = tl.load(candidates_ptr + row_base + offsets, mask=col_mask, other=0)
-    active = (tl.load(node_mask_ptr + row_base + offsets, mask=col_mask, other=0) != 0) & col_mask
+    original_active = (
+        tl.load(node_mask_ptr + row_base + offsets, mask=col_mask, other=0) != 0
+    ) & col_mask
+    active = original_active
     active = active | (offsets == 0)
+    original_active = original_active | (offsets == 0)
+    sibling_keys = tl.load(
+        sibling_keys_ptr + row_base + offsets,
+        mask=col_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
 
     local_logprobs = tl.load(
         draft_logprobs_ptr + row_base + offsets,
         mask=col_mask,
         other=-float("inf"),
     ).to(tl.float32)
-    local_weights = tl.where((offsets > 0) & active, tl.exp(local_logprobs), 0.0)
     draft_probs = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    target_child_probs = tl.zeros((BLOCK_N,), dtype=tl.float32)
 
     for node in tl.range(1, NUM_NODES, loop_unroll_factor=1):
         node_parent = tl.load(parent_indices_ptr + row_base + node)
-        node_weight = tl.load(draft_logprobs_ptr + row_base + node).to(tl.float32)
-        node_weight = tl.exp(node_weight)
+        node_token = tl.load(candidates_ptr + row_base + node)
+        node_token = tl.minimum(tl.maximum(node_token, 0), VOCAB_SIZE - 1)
+        node_logprob = tl.load(draft_logprobs_ptr + row_base + node).to(tl.float32)
+        sibling_max = tl.max(
+            tl.where(
+                (parents == node_parent) & active & (offsets > 0),
+                local_logprobs,
+                -float("inf"),
+            ),
+            axis=0,
+        )
+        node_weight = tl.exp(node_logprob - sibling_max)
         sibling_weight = tl.sum(
-            tl.where((parents == node_parent) & active & (offsets > 0), local_weights, 0.0),
+            tl.where(
+                (parents == node_parent) & active & (offsets > 0),
+                tl.exp(local_logprobs - sibling_max),
+                0.0,
+            ),
             axis=0,
         )
         node_prob = node_weight / tl.maximum(sibling_weight, 1.0e-20)
         node_is_active = (tl.load(node_mask_ptr + row_base + node) != 0) & (sibling_weight > 0.0)
         draft_probs = tl.where((offsets == node) & node_is_active, node_prob, draft_probs)
+        node_target_prob = tl.load(
+            target_probs_ptr + (row_base + node_parent) * VOCAB_SIZE + node_token,
+            mask=node_is_active,
+            other=0.0,
+        ).to(tl.float32)
+        target_child_probs = tl.where(
+            (offsets == node) & node_is_active,
+            node_target_prob,
+            target_child_probs,
+        )
+
+    target_outside_mass = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for parent in tl.range(0, NUM_NODES, loop_unroll_factor=1):
+        child_target_mass = tl.sum(
+            tl.where(
+                original_active & (offsets > 0) & (parents == parent),
+                target_child_probs,
+                0.0,
+            ),
+            axis=0,
+        )
+        target_outside_mass = tl.where(
+            offsets == parent,
+            tl.maximum(1.0 - child_target_mass, 0.0),
+            target_outside_mass,
+        )
+    # A residual update only subtracts mass at represented child tokens. Keep
+    # those values explicitly and represent every other vocabulary item as a
+    # shared scale times its original target probability.
+    target_tail_scale = tl.full((BLOCK_N,), 1.0, dtype=tl.float32)
 
     node_p = tl.where(offsets == 0, 1.0, 0.0).to(tl.float32)
     node_p_valid = offsets == 0
@@ -773,7 +945,6 @@ def _weaver_traversal_verify_kernel(
     while (verify_step < NUM_NODES) & (~done):
         cur = tl.full((), 0, dtype=tl.int64)
         cur_p = tl.full((), 1.0, dtype=tl.float32)
-        parent_for_leaf = tl.full((), 0, dtype=tl.int64)
         p_parent_for_leaf = tl.full((), 1.0, dtype=tl.float32)
         leaf = tl.full((), 0, dtype=tl.int64)
         leaf_p = tl.full((), 1.0, dtype=tl.float32)
@@ -781,20 +952,21 @@ def _weaver_traversal_verify_kernel(
 
         descend_step = tl.full((), 0, dtype=tl.int64)
         while (descend_step < NUM_NODES) & descending:
-            child_values = tl.where(active & (parents == cur), offsets, NUM_NODES)
+            child_mask = active & (parents == cur)
+            child_key = tl.max(
+                tl.where(child_mask, sibling_keys, -float("inf")), axis=0
+            )
+            child_values = tl.where(
+                child_mask & (sibling_keys == child_key), offsets, NUM_NODES
+            )
             child = tl.min(child_values, axis=0)
             has_child = child < NUM_NODES
             take_child = descending & has_child
             take_leaf = descending & (~has_child)
 
-            child_safe = tl.minimum(tl.maximum(child, 0), NUM_NODES - 1)
-            child_token = tl.load(candidates_ptr + row_base + child_safe)
-            child_token_safe = tl.minimum(tl.maximum(child_token, 0), VOCAB_SIZE - 1)
-            child_q = tl.load(
-                target_probs_ptr + (row_base + cur) * VOCAB_SIZE + child_token_safe,
-                mask=take_child,
-                other=0.0,
-            ).to(tl.float32)
+            child_q = tl.sum(
+                tl.where(offsets == child, target_child_probs, 0.0), axis=0
+            )
             child_s = tl.sum(tl.where(offsets == child, draft_probs, 0.0), axis=0)
             computed_child_p = tl.minimum(
                 cur_p * child_q / tl.maximum(child_s, 1.0e-20),
@@ -809,7 +981,6 @@ def _weaver_traversal_verify_kernel(
 
             leaf = tl.where(take_leaf, cur, leaf)
             leaf_p = tl.where(take_leaf, cur_p, leaf_p)
-            parent_for_leaf = tl.where(take_child, cur, parent_for_leaf)
             p_parent_for_leaf = tl.where(take_child, cur_p, p_parent_for_leaf)
             cur = tl.where(take_child, child, cur)
             cur_p = tl.where(take_child, next_child_p, cur_p)
@@ -825,21 +996,36 @@ def _weaver_traversal_verify_kernel(
         reject_parent = tl.load(parent_indices_ptr + row_base + leaf_safe, mask=reject_now, other=0)
         reject_parent = tl.minimum(tl.maximum(reject_parent, 0), NUM_NODES - 1)
 
-        child_mask = active & (parents == reject_parent)
-        child_tokens = tl.minimum(tl.maximum(tokens, 0), VOCAB_SIZE - 1)
-        q_children = tl.load(
-            target_probs_ptr + (row_base + reject_parent) * VOCAB_SIZE + child_tokens,
-            mask=child_mask & reject_now,
-            other=0.0,
-        ).to(tl.float32)
-        q_sum = tl.sum(tl.where(child_mask, q_children, 0.0), axis=0)
-        positive = tl.maximum(p_parent_for_leaf * q_children - draft_probs, 0.0)
-        positive_sum = tl.sum(tl.where(child_mask, positive, 0.0), axis=0)
-        target_tail = tl.maximum(p_parent_for_leaf * (1.0 - q_sum), 0.0)
-        residual_mass = positive_sum + target_tail
+        child_mask = original_active & (offsets > 0) & (parents == reject_parent)
+        target_tail = tl.sum(
+            tl.where(offsets == reject_parent, target_tail_scale, 0.0), axis=0
+        )
+        outside_mass = tl.sum(
+            tl.where(offsets == reject_parent, target_outside_mass, 0.0), axis=0
+        )
+        residual_children = tl.maximum(
+            p_parent_for_leaf * target_child_probs - draft_probs,
+            0.0,
+        )
+        residual_child_mass = tl.sum(
+            tl.where(child_mask, residual_children, 0.0), axis=0
+        )
+        residual_tail_scale = p_parent_for_leaf * target_tail
+        residual_mass = residual_child_mass + residual_tail_scale * outside_mass
         new_parent_p = residual_mass / tl.maximum(
             residual_mass + 1.0 - p_parent_for_leaf,
             1.0e-20,
+        )
+
+        target_child_probs = tl.where(
+            reject_now & child_mask,
+            residual_children / tl.maximum(residual_mass, 1.0e-20),
+            target_child_probs,
+        )
+        target_tail_scale = tl.where(
+            reject_now & (offsets == reject_parent),
+            residual_tail_scale / tl.maximum(residual_mass, 1.0e-20),
+            target_tail_scale,
         )
 
         rejected_s = tl.sum(tl.where(offsets == leaf, draft_probs, 0.0), axis=0)
@@ -858,6 +1044,15 @@ def _weaver_traversal_verify_kernel(
 
     accept_leaf = tl.minimum(tl.maximum(accept_leaf, 0), NUM_NODES - 1)
     tl.store(accept_leaf_ptr + batch, accept_leaf)
+    tl.store(
+        final_target_child_probs_ptr + row_base + offsets,
+        target_child_probs,
+        mask=col_mask,
+    )
+    final_target_tail_scale = tl.sum(
+        tl.where(offsets == accept_leaf, target_tail_scale, 0.0), axis=0
+    )
+    tl.store(final_target_tail_scale_ptr + batch, final_target_tail_scale)
     leaf_depth = tl.load(depths_ptr + row_base + accept_leaf).to(tl.int32)
     tl.store(accept_token_num_ptr + batch, leaf_depth)
 
@@ -872,15 +1067,17 @@ def _weaver_traversal_verify_kernel(
             (row_base + chain_safe).to(tl.int32),
             mask=chain_valid & (chain_depth < NUM_NODES),
         )
-        parent = tl.load(parent_indices_ptr + row_base + chain_safe, mask=chain_valid, other=-1)
-        parent_safe = tl.minimum(tl.maximum(parent, 0), NUM_NODES - 1)
+        chain_parent = tl.load(
+            parent_indices_ptr + row_base + chain_safe, mask=chain_valid, other=-1
+        )
+        parent_safe = tl.minimum(tl.maximum(chain_parent, 0), NUM_NODES - 1)
         token = tl.load(candidates_ptr + row_base + chain_safe, mask=chain_valid, other=0)
         tl.store(
             predicts_ptr + row_base + parent_safe,
             token.to(tl.int32),
-            mask=chain_valid & (parent >= 0),
+            mask=chain_valid & (chain_parent >= 0),
         )
-        chain_node = tl.where(chain_valid, parent, chain_node)
+        chain_node = tl.where(chain_valid, chain_parent, chain_node)
         chain_step += 1
 
 
@@ -1848,6 +2045,67 @@ def build_tree_metadata(
     )
 
 
+def _tree_sampling_uniforms(
+    *,
+    sampling_seed: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    count: int,
+) -> torch.Tensor:
+    if sampling_seed is None:
+        uniforms = torch.rand(
+            (positions.shape[0], count), dtype=torch.float32, device=positions.device
+        )
+    else:
+        from sglang.srt.layers.utils.hash import murmur_hash32
+
+        streams = torch.arange(count, dtype=torch.long, device=positions.device)
+        uniforms = murmur_hash32(
+            sampling_seed.to(torch.long), positions.to(torch.long), streams
+        ).to(torch.float32)
+        uniforms *= 1.0 / 4294967296.0
+    return uniforms.clamp_(
+        min=torch.finfo(torch.float32).tiny,
+        max=1.0 - torch.finfo(torch.float32).eps,
+    )
+
+
+def _filter_tree_target_probs(
+    probs: torch.Tensor,
+    *,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_top_k: bool,
+    need_top_p: bool,
+    sequential: bool,
+) -> torch.Tensor:
+    # The normal flashinfer min-p path applies top-k then top-p. Every other
+    # backend uses joint filtering, whose support is top-p then top-k.
+    filters = (
+        (("top_k", need_top_k), ("top_p", need_top_p))
+        if sequential
+        else (("top_p", need_top_p), ("top_k", need_top_k))
+    )
+    for filter_name, enabled in filters:
+        if not enabled:
+            continue
+        if filter_name == "top_k":
+            probs = top_k_renorm_prob(probs, top_ks)
+        else:
+            probs = top_p_renorm_prob(probs, top_ps)
+
+    thresholds = probs.amax(dim=-1, keepdim=True) * min_ps[:, None]
+    probs = torch.where(probs >= thresholds, probs, 0.0)
+    return probs / probs.sum(dim=-1, keepdim=True)
+
+
+def _sample_prob_rows(probs: torch.Tensor, uniforms: torch.Tensor) -> torch.Tensor:
+    assert probs.ndim == 2
+    assert uniforms.shape == (probs.shape[0],)
+    cdf = torch.cumsum(probs, dim=-1)
+    return torch.sum(cdf < uniforms[:, None], dim=-1).clamp_max(probs.shape[-1] - 1)
+
+
 def _traversal_verify_target_probs(
     *,
     candidates: torch.Tensor,
@@ -1856,7 +2114,9 @@ def _traversal_verify_target_probs(
     node_mask: torch.Tensor,
     draft_logprobs: torch.Tensor,
     target_probs: torch.Tensor,
+    sibling_keys: torch.Tensor,
     uniform_samples: torch.Tensor,
+    bonus_uniforms: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not candidates.is_cuda:
         raise RuntimeError("DFLASH_TFM traversal verification requires CUDA.")
@@ -1870,16 +2130,35 @@ def _traversal_verify_target_probs(
             "target_probs shape must start with candidates.shape, "
             f"got target_probs={tuple(target_probs.shape)}, candidates={tuple(candidates.shape)}."
         )
-    target_probs = target_probs.contiguous()
+    target_probs = target_probs.to(torch.float32).contiguous()
+    target_probs /= target_probs.sum(dim=-1, keepdim=True)
     parent_indices = parent_indices.to(device=candidates.device, dtype=torch.int64)
     depths = depths.to(device=candidates.device, dtype=torch.int64)
     node_mask = node_mask.to(device=candidates.device, dtype=torch.bool)
     draft_logprobs = draft_logprobs.to(device=candidates.device, dtype=torch.float32)
-    uniform_samples = uniform_samples.to(device=candidates.device, dtype=torch.float32)
+    sibling_keys = sibling_keys.to(
+        device=candidates.device, dtype=torch.float32
+    ).contiguous()
+    uniform_samples = uniform_samples.to(
+        device=candidates.device, dtype=torch.float32
+    ).contiguous()
+    bonus_uniforms = bonus_uniforms.to(
+        device=candidates.device, dtype=torch.float32
+    ).contiguous()
+    if sibling_keys.shape != (bs, num_nodes):
+        raise RuntimeError(
+            "sibling_keys shape mismatch for traversal verification: "
+            f"expected {(bs, num_nodes)}, got {tuple(sibling_keys.shape)}."
+        )
     if uniform_samples.shape != (bs, num_nodes):
         raise RuntimeError(
             "uniform_samples shape mismatch for traversal verification: "
             f"expected {(bs, num_nodes)}, got {tuple(uniform_samples.shape)}."
+        )
+    if bonus_uniforms.shape != (bs,):
+        raise RuntimeError(
+            "bonus_uniforms shape mismatch for traversal verification: "
+            f"expected {(bs,)}, got {tuple(bonus_uniforms.shape)}."
         )
 
     predict = torch.empty((bs * num_nodes,), dtype=torch.int32, device=candidates.device)
@@ -1888,6 +2167,12 @@ def _traversal_verify_target_probs(
     )
     num_correct = torch.empty((bs,), dtype=torch.int32, device=candidates.device)
     accept_leaf = torch.empty((bs,), dtype=torch.int64, device=candidates.device)
+    final_target_child_probs = torch.empty(
+        (bs, num_nodes), dtype=torch.float32, device=candidates.device
+    )
+    final_target_tail_scale = torch.empty(
+        (bs,), dtype=torch.float32, device=candidates.device
+    )
     block_n = triton.next_power_of_2(int(num_nodes))
     _weaver_traversal_verify_kernel[(int(bs),)](
         candidates.to(torch.int64),
@@ -1895,21 +2180,81 @@ def _traversal_verify_target_probs(
         depths,
         node_mask,
         draft_logprobs,
+        sibling_keys,
         target_probs,
         uniform_samples,
         predict,
         accept_index,
         num_correct,
         accept_leaf,
+        final_target_child_probs,
+        final_target_tail_scale,
         NUM_NODES=int(num_nodes),
         VOCAB_SIZE=int(target_probs.shape[-1]),
         BLOCK_N=int(block_n),
         num_warps=8,
     )
     row_ids = torch.arange(bs, dtype=torch.long, device=candidates.device)
-    bonus = torch.multinomial(target_probs[row_ids, accept_leaf], 1).squeeze(1)
+    bonus_probs = (
+        target_probs[row_ids, accept_leaf] * final_target_tail_scale[:, None]
+    )
+    child_mask = node_mask & (parent_indices == accept_leaf[:, None])
+    child_rows, child_nodes = torch.where(child_mask)
+    bonus_probs[
+        child_rows,
+        candidates[child_rows, child_nodes].to(torch.long),
+    ] = final_target_child_probs[child_rows, child_nodes]
+    bonus_probs /= bonus_probs.sum(dim=-1, keepdim=True)
+    bonus_cdf = torch.cumsum(bonus_probs, dim=-1)
+    bonus = torch.sum(bonus_cdf < bonus_uniforms[:, None], dim=-1).clamp_max(
+        bonus_probs.shape[-1] - 1
+    )
     predict[row_ids * num_nodes + accept_leaf] = bonus.to(torch.int32)
     return predict, accept_index, num_correct, accept_leaf
+
+
+def _target_only_verify_target_probs(
+    *,
+    candidates: torch.Tensor,
+    retrieve_index: torch.Tensor,
+    retrieve_next_token: torch.Tensor,
+    retrieve_next_sibling: torch.Tensor,
+    target_probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    bonus_uniforms: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bs, num_nodes = candidates.shape
+    target_probs = target_probs.to(torch.float32).contiguous()
+    uniform_samples = uniform_samples.to(
+        device=candidates.device, dtype=torch.float32
+    ).contiguous()
+    bonus_uniforms = bonus_uniforms.to(
+        device=candidates.device, dtype=torch.float32
+    ).contiguous()
+    predict = torch.full(
+        (bs * num_nodes,), -1, dtype=torch.int32, device=candidates.device
+    )
+    accept_index = torch.full(
+        (bs, num_nodes), -1, dtype=torch.int32, device=candidates.device
+    )
+    num_correct = torch.empty((bs,), dtype=torch.int32, device=candidates.device)
+    _weaver_target_only_verify_kernel[(int(bs),)](
+        candidates.to(torch.int64),
+        retrieve_index,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        target_probs,
+        uniform_samples,
+        bonus_uniforms,
+        predict,
+        accept_index,
+        num_correct,
+        NUM_NODES=int(num_nodes),
+        VOCAB_SIZE=int(target_probs.shape[-1]),
+        BLOCK_V=4096,
+        num_warps=8,
+    )
+    return predict, accept_index, num_correct
 
 
 class DFlashTfmVerifyInput(DFlashVerifyInput):
@@ -1928,6 +2273,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         parent_indices: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
         draft_logprobs: Optional[torch.Tensor] = None,
+        tree_sampling_mode: str,
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL,
     ):
         super().__init__(
@@ -1951,6 +2297,9 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         self.parent_indices = parent_indices
         self.node_mask = node_mask
         self.draft_logprobs = draft_logprobs
+        if tree_sampling_mode not in ("target_only", "traversal"):
+            raise ValueError(f"Unknown DFLASH_TFM tree sampling mode: {tree_sampling_mode!r}")
+        self.tree_sampling_mode = tree_sampling_mode
         # Tree-local slot of each request's last accepted node; populated by
         # verify() and consumed by the post-verify Mamba/GDN state commit.
         self.accept_leaf_slots: Optional[torch.Tensor] = None
@@ -2098,27 +2447,80 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                 "DFLASH_TFM traversal verification requires tree parents, "
                 "node mask, and draft log-probabilities."
             )
+        penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+        if penalizer is not None and penalizer.is_required:
+            raise RuntimeError(
+                "Lossless DFLASH_TFM tree sampling does not yet support "
+                "frequency, presence, or repetition penalties because they must "
+                "evolve independently along every tree path."
+            )
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, self.draft_token_num, dim=0
         )
         target_probs = F.softmax(
-            logits_output.next_token_logits / expanded_temperature, dim=-1
+            (logits_output.next_token_logits / expanded_temperature).float(), dim=-1
         )
-        if getattr(sampling_info, "need_top_k_sampling", True):
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
-                ),
-            )
-        if sampling_info.need_top_p_sampling:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
-                ),
-            )
+        top_ks = torch.repeat_interleave(
+            sampling_info.top_ks, self.draft_token_num, dim=0
+        )
+        top_ps = torch.repeat_interleave(
+            sampling_info.top_ps, self.draft_token_num, dim=0
+        )
+        min_ps = torch.repeat_interleave(
+            sampling_info.min_ps, self.draft_token_num, dim=0
+        )
+        from sglang.srt.server_args import get_global_server_args
+
+        server_args = get_global_server_args()
+        sequential_filters = (
+            server_args.sampling_backend == "flashinfer"
+            and sampling_info.need_min_p_sampling
+        )
+        target_probs = _filter_tree_target_probs(
+            target_probs,
+            top_ks=top_ks,
+            top_ps=top_ps,
+            min_ps=min_ps,
+            need_top_k=sampling_info.need_top_k_sampling,
+            need_top_p=sampling_info.need_top_p_sampling,
+            sequential=sequential_filters,
+        )
         target_probs = target_probs.view(bs, self.draft_token_num, -1)
+        random_count = (
+            self.draft_token_num + 1
+            if self.tree_sampling_mode == "target_only"
+            else 2 * self.draft_token_num + 1
+        )
+        random_values = _tree_sampling_uniforms(
+            sampling_seed=sampling_info.sampling_seed,
+            positions=batch.seq_lens,
+            count=random_count,
+        )
+        if self.tree_sampling_mode == "target_only":
+            target_uniforms = random_values[:, : self.draft_token_num].contiguous()
+            if torch.version.hip is not None:
+                target_predict = _sample_prob_rows(
+                    target_probs.flatten(0, 1), target_uniforms.flatten()
+                ).view(bs, self.draft_token_num)
+                return self._verify_from_target_predict(target_predict, bs)
+            return _target_only_verify_target_probs(
+                candidates=candidates,
+                retrieve_index=self.retrieve_index,
+                retrieve_next_token=self.retrieve_next_token,
+                retrieve_next_sibling=self.retrieve_next_sibling,
+                target_probs=target_probs,
+                uniform_samples=target_uniforms,
+                bonus_uniforms=random_values[:, -1],
+            )
+        if self.tree_sampling_mode != "traversal":
+            raise ValueError(
+                f"Unknown DFLASH_TFM tree sampling mode: {self.tree_sampling_mode!r}"
+            )
+        # q_T is proportional to exp(draft_logprob) over the final retained
+        # siblings and zero elsewhere. Gumbel sorting samples q_T's
+        # Plackett-Luce order without replacement.
+        sibling_uniforms = random_values[:, : self.draft_token_num].contiguous()
+        sibling_keys = self.draft_logprobs - torch.log(-torch.log(sibling_uniforms))
         predict, accept_index, num_correct, _ = _traversal_verify_target_probs(
             candidates=candidates.to(torch.int64),
             parent_indices=self.parent_indices,
@@ -2126,7 +2528,11 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             node_mask=self.node_mask,
             draft_logprobs=self.draft_logprobs,
             target_probs=target_probs,
-            uniform_samples=torch.rand_like(candidates, dtype=torch.float32),
+            sibling_keys=sibling_keys,
+            uniform_samples=random_values[
+                :, self.draft_token_num : 2 * self.draft_token_num
+            ].contiguous(),
+            bonus_uniforms=random_values[:, -1],
         )
         return predict, accept_index, num_correct
 
@@ -2353,6 +2759,9 @@ class DFlashTfmWorker(DFlashWorkerV2):
             dtype=dtype,
         )
         self.tree_budget = int(self.server_args.speculative_dflash_tfm_tree_budget or 128)
+        self.tree_sampling_mode = (
+            self.server_args.speculative_dflash_tfm_tree_sampling_mode
+        )
         requested_pool_size = int(
             self.server_args.speculative_dflash_tfm_candidate_pool_size
             or self.weaver.candidate_pool_size
@@ -4057,6 +4466,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             parent_indices=tree.parent_indices,
             node_mask=tree.node_mask,
             draft_logprobs=tree.draft_logprobs,
+            tree_sampling_mode=self.tree_sampling_mode,
         )
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = verify_input

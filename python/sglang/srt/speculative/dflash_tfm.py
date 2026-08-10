@@ -1517,19 +1517,67 @@ class WeaverRMSNorm(nn.Module):
 
 
 class WeaverBlock(nn.Module):
-    def __init__(self, d_rank: int, num_heads: int, mlp_dim: int):
+    def __init__(
+        self,
+        d_rank: int,
+        num_heads: int,
+        mlp_dim: int,
+        *,
+        rope_base: float = 10_000.0,
+    ):
         super().__init__()
         if d_rank % num_heads != 0:
             raise ValueError("d_rank must be divisible by num_heads")
         self.d_rank = int(d_rank)
         self.num_heads = int(num_heads)
         self.head_dim = int(d_rank // num_heads)
+        if self.head_dim % 2 != 0:
+            raise ValueError("RoPE requires an even attention head dimension")
+        if rope_base <= 0:
+            raise ValueError("rope_base must be positive")
+        self.rope_base = float(rope_base)
         self.norm_attn = WeaverRMSNorm(d_rank)
         self.qkv_proj = nn.Linear(d_rank, 3 * d_rank, bias=False)
         self.o_proj = nn.Linear(d_rank, d_rank, bias=False)
         self.norm_mlp = WeaverRMSNorm(d_rank)
-        self.fc1 = nn.Linear(d_rank, mlp_dim)
-        self.fc2 = nn.Linear(mlp_dim, d_rank)
+        self.gate_up_proj = nn.Linear(d_rank, 2 * mlp_dim)
+        self.down_proj = nn.Linear(mlp_dim, d_rank)
+
+    def _apply_rope(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        half_dim = self.head_dim // 2
+        inv_freq = torch.arange(
+            0,
+            self.head_dim,
+            2,
+            dtype=torch.float32,
+            device=q.device,
+        )
+        inv_freq = self.rope_base ** (-inv_freq / self.head_dim)
+        angles = positions.float()[..., None] * inv_freq
+        half_cos = angles.cos()
+        half_sin = angles.sin()
+        cos = torch.cat([half_cos, half_cos], dim=-1).unsqueeze(-2)
+        sin = torch.cat([half_sin, half_sin], dim=-1).unsqueeze(-2)
+
+        def rotate_half(x: torch.Tensor) -> torch.Tensor:
+            return torch.cat((-x[..., half_dim:], x[..., :half_dim]), dim=-1)
+
+        q_float = q.float()
+        k_float = k.float()
+        return (
+            (q_float * cos + rotate_half(q_float) * sin).to(q.dtype),
+            (k_float * cos + rotate_half(k_float) * sin).to(k.dtype),
+        )
+
+    def _mlp(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm_mlp(x)
+        gate, up = self.gate_up_proj(h).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
     def forward(
         self,
@@ -1545,6 +1593,8 @@ class WeaverBlock(nn.Module):
             rows, steps, 3, self.num_heads, self.head_dim
         )
         q, k, v = qkv.unbind(dim=2)
+        positions = torch.arange(steps, dtype=torch.long, device=x.device)
+        q, k = self._apply_rope(q, k, positions[None])
         scale = self.head_dim**-0.5
         ext_scores = torch.einsum("rshd,rsphd->rhsp", q, external_keys) * scale
         tok_scores = torch.einsum("rshd,rthd->rhst", q, k) * scale
@@ -1558,7 +1608,7 @@ class WeaverBlock(nn.Module):
         )
         tok_y = torch.einsum("rhst,rthd->rshd", attn[:, :, :, prefix:], v)
         x = x + self.o_proj((ext_y + tok_y).reshape(rows, steps, self.d_rank))
-        x = x + self.fc2(F.gelu(self.fc1(self.norm_mlp(x))))
+        x = x + self._mlp(x)
         return x, k, v
 
     def forward_indexed(
@@ -1582,6 +1632,7 @@ class WeaverBlock(nn.Module):
             rows, steps, 3, self.num_heads, self.head_dim
         )
         q, k, v = qkv.unbind(dim=2)
+        q, k = self._apply_rope(q, k, position_ids[:, None] + 1)
         q = q.squeeze(1).contiguous()
         k = k.squeeze(1).contiguous()
         v = v.squeeze(1).contiguous()
@@ -1600,7 +1651,7 @@ class WeaverBlock(nn.Module):
             layer_index,
         )
         x = x + self.o_proj(y.reshape(rows, steps, self.d_rank))
-        x = x + self.fc2(F.gelu(self.fc1(self.norm_mlp(x))))
+        x = x + self._mlp(x)
         return x, k, v
 
     def forward_chain(
@@ -1622,6 +1673,7 @@ class WeaverBlock(nn.Module):
             rows, steps, 3, self.num_heads, self.head_dim
         )
         q, k, v = qkv.unbind(dim=2)
+        q, k = self._apply_rope(q, k, position_ids[:, None] + 1)
         q = q.squeeze(1).contiguous()
         k = k.squeeze(1).contiguous()
         v = v.squeeze(1).contiguous()
@@ -1638,7 +1690,7 @@ class WeaverBlock(nn.Module):
             layer_index,
         )
         x = x + self.o_proj(y.reshape(rows, steps, self.d_rank))
-        x = x + self.fc2(F.gelu(self.fc1(self.norm_mlp(x))))
+        x = x + self._mlp(x)
         return x, k, v
 
 
@@ -1659,6 +1711,8 @@ class Weaver(nn.Module):
         candidate_pool_size: int,
         encoder_mode: int = ENCODER_GLOBAL_PROMPT,
         score_head: int = SCORE_SIMPLE,
+        activation: str = "swiglu",
+        rope_base: float = 10_000.0,
     ):
         super().__init__()
         if int(encoder_mode) != self.ENCODER_GLOBAL_PROMPT:
@@ -1669,6 +1723,10 @@ class Weaver(nn.Module):
             raise ValueError(
                 "DFlash+Weaver MVP supports score_head=simple_score only."
             )
+        if activation != "swiglu":
+            raise ValueError("DFlash+Weaver requires activation='swiglu'.")
+        if rope_base <= 0:
+            raise ValueError("DFlash+Weaver requires a positive rope_base.")
         self.d_model = int(d_model)
         self.d_embed = int(d_embed)
         self.d_rank = int(d_rank)
@@ -1677,39 +1735,25 @@ class Weaver(nn.Module):
         self.mlp_dim = int(mlp_dim)
         self.K = int(K)
         self.candidate_pool_size = int(candidate_pool_size)
+        self.activation = "swiglu"
+        self.rope_base = float(rope_base)
         self.output_norm = WeaverRMSNorm(d_model)
         self.embed_norm = WeaverRMSNorm(d_embed)
         self.token_in = nn.Linear(d_embed, d_rank)
         self.proposal_in = nn.Linear(d_model, d_rank)
         self.blocks = nn.ModuleList(
-            [WeaverBlock(d_rank, num_heads, mlp_dim) for _ in range(num_layers)]
+            [
+                WeaverBlock(
+                    d_rank,
+                    num_heads,
+                    mlp_dim,
+                    rope_base=self.rope_base,
+                )
+                for _ in range(num_layers)
+            ]
         )
         self.out_norm = WeaverRMSNorm(d_rank)
         self.lm_head_query_in = nn.Linear(d_rank, d_model, bias=False)
-        self.pos_emb = nn.Parameter(torch.zeros(K, d_rank))
-
-    @staticmethod
-    def _migrate_state_dict(
-        state_dict: dict[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        migrated = dict(state_dict)
-        q_suffix = "q_proj.weight"
-        prefixes = [
-            key[: -len(q_suffix)] for key in migrated.keys() if key.endswith(q_suffix)
-        ]
-        for prefix in prefixes:
-            q_key = f"{prefix}q_proj.weight"
-            k_key = f"{prefix}k_proj.weight"
-            v_key = f"{prefix}v_proj.weight"
-            qkv_key = f"{prefix}qkv_proj.weight"
-            if qkv_key not in migrated:
-                migrated[qkv_key] = torch.cat(
-                    [migrated[q_key], migrated[k_key], migrated[v_key]], dim=0
-                )
-            migrated.pop(q_key, None)
-            migrated.pop(k_key, None)
-            migrated.pop(v_key, None)
-        return migrated
 
     @classmethod
     def load(
@@ -1727,9 +1771,7 @@ class Weaver(nn.Module):
                 "JAX/Equinox conversion is intentionally a separate final step."
             )
         model = cls(**payload["config"]).to(device=device, dtype=dtype)
-        model.load_state_dict(
-            cls._migrate_state_dict(payload["state_dict"]), strict=True
-        )
+        model.load_state_dict(payload["state_dict"], strict=True)
         model.eval()
         return model
 
@@ -1746,7 +1788,7 @@ class Weaver(nn.Module):
         output_norm_features: torch.Tensor,
         proposal_features: torch.Tensor,
     ) -> torch.Tensor:
-        rows, steps, _ = proposal_features.shape
+        rows, _, _ = proposal_features.shape
         first_output = self.output_norm(output_norm_features[:, :1].float()).to(
             dtype=proposal_features.dtype
         )
@@ -1755,16 +1797,12 @@ class Weaver(nn.Module):
             dtype=proposal_features.dtype
         )
         proposal_tokens = self.proposal_in(proposal)
-        proposal_tokens = (
-            proposal_tokens + self.pos_emb[:steps].to(dtype=proposal_tokens.dtype)[None]
-        )
         return torch.cat([output_token, proposal_tokens], dim=1)
 
     def prompt_external_kv(
         self,
         output_norm_features: torch.Tensor,
         proposal_features: torch.Tensor,
-        steps: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         x = self._prompt_tokens(output_norm_features, proposal_features)
         rows, prefix, _ = x.shape
@@ -1817,11 +1855,6 @@ class Weaver(nn.Module):
         depth = parent_ancestors.shape[1]
         x = self._token_project(token_ids[:, None], token_embed)
         position_ids = position_ids.clamp(min=0, max=depth - 1)
-        pos_emb_ids = position_ids.clamp(max=self.K - 1)
-        pos_emb = torch.index_select(self.pos_emb, 0, pos_emb_ids.reshape(-1)).view(
-            pos_emb_ids.shape[0], self.d_rank
-        )
-        x = x + pos_emb[:, None].to(dtype=x.dtype)
         current_key_layers = []
         current_value_layers = []
         for layer_index, block in enumerate(self.blocks):
@@ -1865,11 +1898,6 @@ class Weaver(nn.Module):
         depth = chain_keys.shape[1]
         x = self._token_project(token_ids[:, None], token_embed)
         position_ids = position_ids.clamp(min=0, max=depth - 1)
-        pos_emb_ids = position_ids.clamp(max=self.K - 1)
-        pos_emb = torch.index_select(self.pos_emb, 0, pos_emb_ids.reshape(-1)).view(
-            pos_emb_ids.shape[0], self.d_rank
-        )
-        x = x + pos_emb[:, None].to(dtype=x.dtype)
         current_key_layers = []
         current_value_layers = []
         for layer_index, block in enumerate(self.blocks):

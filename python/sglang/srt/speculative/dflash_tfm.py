@@ -61,6 +61,8 @@ def _weaver_candidate_frontier_kernel(
     frontier_scores_ptr,
     frontier_logprobs_ptr,
     frontier_active_ptr,
+    frontier_is_sampled_ptr,
+    uniforms_ptr,
     slot_start,
     WIDTH: tl.constexpr,
     POOL_SIZE: tl.constexpr,
@@ -88,7 +90,13 @@ def _weaver_candidate_frontier_kernel(
     log_denom = tl.log(tl.sum(exp_scores, axis=0)) + max_score
     child_base = batch * FRONTIER_SLOTS + (slot_start + row_in_width) * EXPAND_WIDTH
     child_depth = parent_depth + 1
-    for child in tl.static_range(0, EXPAND_WIDTH):
+    # UniVer node construction: (EXPAND_WIDTH - 1) deterministic top-K children plus
+    # ONE child sampled from the residual draft distribution. The cascade identity
+    # min(1, q/s) is only lossless for a candidate drawn from s, so a tree of pure
+    # top-K cannot be verified losslessly at temperature > 0; the sampled child is
+    # what restores it.
+    best_norm = tl.full((), -float("inf"), dtype=tl.float32)
+    for child in tl.static_range(0, EXPAND_WIDTH - 1):
         top_value, top_index = tl.max(
             scores,
             axis=0,
@@ -97,6 +105,9 @@ def _weaver_candidate_frontier_kernel(
         )
         child_token = tl.load(candidate_ids_ptr + row * POOL_SIZE + top_index)
         child_valid = parent_active & (child_token >= 0) & (top_value != -float("inf"))
+        norm_lp = top_value - log_denom
+        if child == 0:
+            best_norm = norm_lp
         out_index = child_base + child
         tl.store(frontier_tokens_ptr + out_index, tl.where(child_valid, child_token, 0))
         tl.store(
@@ -106,14 +117,53 @@ def _weaver_candidate_frontier_kernel(
         tl.store(frontier_depths_ptr + out_index, tl.where(child_valid, child_depth, 0))
         tl.store(
             frontier_scores_ptr + out_index,
-            tl.where(child_valid, parent_score + top_value - log_denom, -float("inf")),
+            tl.where(child_valid, parent_score + norm_lp, -float("inf")),
         )
         tl.store(
             frontier_logprobs_ptr + out_index,
-            tl.where(child_valid, top_value - log_denom, -float("inf")),
+            tl.where(child_valid, norm_lp, -float("inf")),
         )
         tl.store(frontier_active_ptr + out_index, child_valid)
+        tl.store(frontier_is_sampled_ptr + out_index, False)
         scores = tl.where(offsets == top_index, -float("inf"), scores)
+
+    # `scores` now holds the pool with the deterministic children removed: exactly
+    # the residual draft distribution ms. Sample one child from it by inverse CDF.
+    resid_max = tl.max(scores, axis=0)
+    resid_exp = tl.where(scores == -float("inf"), 0.0, tl.exp(scores - resid_max))
+    resid_sum = tl.sum(resid_exp, axis=0)
+    resid_ok = resid_sum > 0.0
+    resid_probs = resid_exp / tl.maximum(resid_sum, 1e-20)
+    cdf = tl.cumsum(resid_probs, axis=0)
+    u = tl.load(uniforms_ptr + child_base)
+    sel = tl.min(tl.where(cdf >= u, offsets, POOL_SIZE), axis=0)
+    sel = tl.minimum(tl.maximum(sel, 0), POOL_SIZE - 1)
+    samp_token = tl.load(candidate_ids_ptr + row * POOL_SIZE + sel)
+    samp_p = tl.sum(tl.where(offsets == sel, resid_probs, 0.0), axis=0)
+    samp_valid = parent_active & (samp_token >= 0) & resid_ok & (samp_p > 0.0)
+    out_index = child_base + (EXPAND_WIDTH - 1)
+    tl.store(frontier_tokens_ptr + out_index, tl.where(samp_valid, samp_token, 0))
+    tl.store(
+        frontier_parents_ptr + out_index,
+        tl.where(samp_valid, slot_start + row_in_width, 0),
+    )
+    tl.store(frontier_depths_ptr + out_index, tl.where(samp_valid, child_depth, 0))
+    # Scored just above the best sibling: global frontier selection must never keep a
+    # deterministic child while pruning the sampled one, or the node loses the very
+    # child that makes it verifiable. The offset is tiny so cross-node ordering is
+    # essentially unchanged.
+    tl.store(
+        frontier_scores_ptr + out_index,
+        tl.where(samp_valid, parent_score + best_norm + 1e-3, -float("inf")),
+    )
+    # Stored relative to the RESIDUAL, i.e. this is log ms(u_m) — the denominator
+    # UniVer's acceptance term needs, not the full-pool logprob.
+    tl.store(
+        frontier_logprobs_ptr + out_index,
+        tl.where(samp_valid, tl.log(tl.maximum(samp_p, 1e-20)), -float("inf")),
+    )
+    tl.store(frontier_active_ptr + out_index, samp_valid)
+    tl.store(frontier_is_sampled_ptr + out_index, samp_valid)
 
 @triton.jit
 def _weaver_indexed_attention_kernel(
@@ -1376,6 +1426,9 @@ class WeaverTree(msgspec.Struct):
     depths: torch.Tensor
     node_mask: torch.Tensor
     draft_logprobs: torch.Tensor
+    # True for the one child per node drawn from the residual draft distribution.
+    # Verification needs to tell it apart from its deterministic top-K siblings.
+    is_sampled: torch.Tensor
 
 
 class WeaverTreeCudaGraph(msgspec.Struct):
@@ -2378,11 +2431,14 @@ class DFlashTfmWorker(DFlashWorkerV2):
         draft_logprobs = torch.full(
             (bs, num_nodes), -torch.inf, dtype=torch.float32, device=device
         )
+        is_sampled = torch.zeros((bs, num_nodes), dtype=torch.bool, device=device)
         tokens[:, 0] = root_ids
         node_mask[:, 0] = True
         draft_logprobs[:, 0] = 0.0
         if node_budget <= 0 or depth <= 0:
-            return WeaverTree(tokens, parents, depths, node_mask, draft_logprobs)
+            return WeaverTree(
+                tokens, parents, depths, node_mask, draft_logprobs, is_sampled
+            )
 
         expand_width = min(WEAVER_TREE_EXPAND_WIDTH, int(pool_size))
         frontier_slots = (node_budget + 1) * expand_width
@@ -2427,6 +2483,15 @@ class DFlashTfmWorker(DFlashWorkerV2):
         frontier_active = torch.zeros(
             (bs, frontier_slots), dtype=torch.bool, device=device
         )
+        frontier_is_sampled = torch.zeros(
+            (bs, frontier_slots), dtype=torch.bool, device=device
+        )
+        # Preallocated so the residual draw stays CUDA-graph capturable: uniform_()
+        # fills in place, whereas torch.rand inside the loop would allocate on replay.
+        frontier_uniforms = torch.empty(
+            (bs, frontier_slots), dtype=torch.float32, device=device
+        )
+        frontier_uniforms.uniform_()
         if device.type != "cuda" or expand_width != 8:
             raise RuntimeError(
                 "Weaver tree construction requires Triton on CUDA with "
@@ -2455,6 +2520,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 frontier_scores,
                 frontier_logprobs,
                 frontier_active,
+                frontier_is_sampled,
+                frontier_uniforms,
                 int(slot_start),
                 WIDTH=int(width),
                 POOL_SIZE=int(pool_size),
@@ -2612,6 +2679,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             node_depth = frontier_depths.gather(1, frontier_index)
             node_score = frontier_scores.gather(1, frontier_index)
             node_logprob = frontier_logprobs.gather(1, frontier_index)
+            node_sampled = frontier_is_sampled.gather(1, frontier_index)
 
             tokens[:, slot_slice] = torch.where(
                 valid, token, torch.zeros_like(token)
@@ -2626,6 +2694,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             draft_logprobs[:, slot_slice] = torch.where(
                 valid, node_logprob, torch.full_like(node_logprob, -torch.inf)
             )
+            is_sampled[:, slot_slice] = valid & node_sampled
             frontier_active.scatter_(1, frontier_index, False)
 
             if slot_stop > node_budget:
@@ -2666,7 +2735,9 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 width,
             )
             slot_start = slot_stop
-        return WeaverTree(tokens, parents, depths, node_mask, draft_logprobs)
+        return WeaverTree(
+            tokens, parents, depths, node_mask, draft_logprobs, is_sampled
+        )
 
     def _build_chain_impl(
         self,

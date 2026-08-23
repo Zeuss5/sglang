@@ -1934,6 +1934,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
 
 
 class DFlashTfmWorker(DFlashWorkerV2):
+    _knobs_logged = False
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: List[int], batch_size: int = 0
     ) -> None:
@@ -2573,6 +2574,17 @@ class DFlashTfmWorker(DFlashWorkerV2):
 
         # Read once: this is the per-node hot loop.
         depth_bonus = envs.SGLANG_DFLASH_TFM_DEPTH_BONUS.get()
+        if not DFlashTfmWorker._knobs_logged:
+            DFlashTfmWorker._knobs_logged = True
+            # Emitted once per process so a run log carries proof of which knob
+            # values actually took effect — an env var that silently failed to
+            # reach the container is otherwise indistinguishable from a null result.
+            logger.info(
+                "DFLASH_TFM tree knobs: expand_unit=%d depth_bonus=%g batch_expand_width=%d",
+                envs.SGLANG_DFLASH_TFM_EXPAND_UNIT.get(),
+                depth_bonus,
+                batch_expand_width,
+            )
         if depth_bonus > 0.0:
             raise ValueError(
                 "SGLANG_DFLASH_TFM_DEPTH_BONUS must be <= 0; a positive depth "

@@ -307,6 +307,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.chunk_tree_verify_active
             and gdn_fused_tree_verify_enabled(model_runner.server_args)
         )
+        # Upper bound on rows the fused tree-structure buffers must hold: graph
+        # capture uses cuda_graph_max_bs_decode, runtime uses max_running_requests.
+        _sa = model_runner.server_args
+        self._fused_tree_max_bs = max(
+            1,
+            int(_sa.cuda_graph_max_bs_decode or 0),
+            int(_sa.max_running_requests or 0),
+        )
+        self._fused_tree_view = None
         if (
             model_runner.server_args.speculative_gdn_verify_kernel == "chunk"
             and not model_runner.is_draft_worker
@@ -666,11 +675,19 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 build_tree_structure_into,
             )
 
+            # Size the persistent buffers for the LARGEST batch this server can
+            # run, not the first one seen. CUDA-graph capture walks descending
+            # batch sizes, so allocating at the first (largest) and then copying a
+            # smaller batch into it raised
+            #   "size of tensor a (8) must match tensor b (7)"
+            # and killed every capture past the first. Buffers must keep stable
+            # pointers for replay, so they cannot be reallocated per batch size:
+            # allocate once at the max and write into a prefix view.
             if getattr(self, "_fused_tree_struct", None) is None:
                 self._fused_tree_struct = alloc_tree_structure_buffers(
-                    batch_size, draft_token_num, retrieve_parent_token.device
+                    self._fused_tree_max_bs, draft_token_num, retrieve_parent_token.device
                 )
-            build_tree_structure_into(
+            self._fused_tree_view = build_tree_structure_into(
                 retrieve_parent_token[:batch_size].view(batch_size, draft_token_num),
                 self._fused_tree_struct,
             )
@@ -728,8 +745,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         stash_v.copy_(value.view(bs, T, H, V))
         value = stash_v
 
-        tree = self._fused_tree_struct
+        # Must be the prefix VIEW built for this step's batch size, not the
+        # persistent buffer, which is sized for the largest batch the server can
+        # run. Passing the full buffer would mismatch the (bs, T, ...) operands.
+        tree = self._fused_tree_view
         assert tree is not None, "fused tree structure metadata missing"
+        assert tree.parent.shape[0] == bs, (
+            f"tree structure batch {tree.parent.shape[0]} != forward batch {bs}"
+        )
         o = tree_gdn_triton_verify(
             layer.A_log,
             a.view(bs, T, H),

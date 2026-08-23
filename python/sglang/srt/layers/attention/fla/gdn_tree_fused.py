@@ -135,6 +135,16 @@ def build_tree_structure_into(parent_src: torch.Tensor, buf: "TreeStructure") ->
     parent = parent_src.long()
     N, T = parent.shape
     device = parent.device
+    # `buf` may be allocated for a larger batch than this call uses: CUDA-graph
+    # capture walks several batch sizes and the buffers must keep stable pointers
+    # across all of them, so they are sized once for the largest. Write into the
+    # first N rows and return a view of exactly those. Views share storage, so
+    # pointers stay stable for replay.
+    if buf.parent.shape[0] < N:
+        raise ValueError(
+            f"tree-structure buffer holds {buf.parent.shape[0]} rows, need {N}; "
+            "allocate with the max batch size"
+        )
     eye = torch.eye(T, dtype=torch.float32, device=device).expand(N, T, T)
     edge = torch.zeros(N, T, T, dtype=torch.float32, device=device)
     edge.scatter_(2, parent.clamp_min(0).unsqueeze(-1), (parent >= 0).float().unsqueeze(-1))
@@ -143,16 +153,26 @@ def build_tree_structure_into(parent_src: torch.Tensor, buf: "TreeStructure") ->
         reach = (reach @ reach).clamp_(max=1.0)
     anc = reach > 0
     neg_inf = float("-inf")
-    buf.parent.copy_(parent)
-    buf.anc_mask.copy_(anc)
-    buf.anc_f.copy_(anc.float())
-    buf.anc_u8.copy_(anc.to(torch.uint8))
+    buf.parent[:N].copy_(parent)
+    buf.anc_mask[:N].copy_(anc)
+    buf.anc_f[:N].copy_(anc.float())
+    buf.anc_u8[:N].copy_(anc.to(torch.uint8))
     incl = torch.where(anc, 0.0, neg_inf).float()
-    buf.logmask_incl.copy_(incl)
+    buf.logmask_incl[:N].copy_(incl)
     incl_strict = incl.clone()
     incl_strict.diagonal(dim1=-2, dim2=-1).fill_(neg_inf)
-    buf.logmask_strict.copy_(incl_strict)
-    return buf
+    buf.logmask_strict[:N].copy_(incl_strict)
+    if N == buf.parent.shape[0]:
+        return buf
+    return TreeStructure(
+        parent=buf.parent[:N],
+        anc_mask=buf.anc_mask[:N],
+        anc_f=buf.anc_f[:N],
+        anc_u8=buf.anc_u8[:N],
+        logmask_incl=buf.logmask_incl[:N],
+        logmask_strict=buf.logmask_strict[:N],
+        max_depth=buf.max_depth,
+    )
 
 
 def alloc_tree_structure_buffers(N: int, T: int, device) -> "TreeStructure":

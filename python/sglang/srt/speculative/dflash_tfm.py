@@ -63,6 +63,8 @@ def _weaver_candidate_frontier_kernel(
     frontier_active_ptr,
     frontier_is_sampled_ptr,
     uniforms_ptr,
+    node_pool_ids_ptr,
+    node_pool_ms_ptr,
     slot_start,
     WIDTH: tl.constexpr,
     POOL_SIZE: tl.constexpr,
@@ -70,6 +72,7 @@ def _weaver_candidate_frontier_kernel(
     DEPTH: tl.constexpr,
     FRONTIER_SLOTS: tl.constexpr,
     BLOCK_POOL: tl.constexpr,
+    NUM_NODES: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_POOL)
@@ -164,6 +167,17 @@ def _weaver_candidate_frontier_kernel(
     )
     tl.store(frontier_active_ptr + out_index, samp_valid)
     tl.store(frontier_is_sampled_ptr + out_index, samp_valid)
+
+    # Persist this node's pool and residual ms. Verification needs
+    #   Z_v = 1 - p~ + sum_{x in pool}[p~q(x) - ms(x)]_+ + p~*(1 - Q_pool)
+    # which couples build-time ms against target probs that do not exist yet, so
+    # neither side can precompute it and ms has to survive to the verify kernel.
+    node_slot = slot_start + row_in_width
+    pool_base = (batch * NUM_NODES + node_slot) * POOL_SIZE
+    tl.store(node_pool_ids_ptr + pool_base + offsets,
+             tl.where(pool_mask, token_ids, 0), mask=pool_mask)
+    tl.store(node_pool_ms_ptr + pool_base + offsets,
+             tl.where(pool_mask & parent_active, resid_probs, 0.0), mask=pool_mask)
 
 @triton.jit
 def _weaver_indexed_attention_kernel(
@@ -710,6 +724,274 @@ def _weaver_traversal_verify_kernel(
         )
         chain_node = tl.where(chain_valid, parent, chain_node)
         chain_step += 1
+
+
+@triton.jit
+def _univer_verify_kernel(
+    candidates_ptr,
+    parent_indices_ptr,
+    depths_ptr,
+    node_mask_ptr,
+    draft_logprobs_ptr,
+    is_sampled_ptr,
+    pool_ids_ptr,
+    pool_ms_ptr,
+    target_probs_ptr,
+    uniform_samples_ptr,
+    predicts_ptr,
+    accept_index_ptr,
+    accept_token_num_ptr,
+    accept_leaf_ptr,
+    residual_ptr,
+    residual_valid_ptr,
+    NUM_NODES: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+    POOL_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_POOL: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    """UniVer verification (arXiv 2605.04543).
+
+    The cascade this replaces accepts with min(1, cur_p*q/s), an identity that is
+    lossless only for a candidate drawn with probability s. Our children are the
+    drafter's top-K plus one residual sample, so it needs a rule built for a mixed
+    deterministic/sampled candidate set.
+
+    Allocation runs top-down (parent[i] < i, so index order is topological):
+        Z_v    = 1 - p~ + sum_{x in pool}[p~q(x) - ms(x)]_+ + p~*(1 - Q_pool)
+        p(u_m) = min(1, p~*q(u_m)/ms(u_m))
+        p(u_k) = [p~*q(u_k) - ms(u_k)]_+ * (1 - p(u_m)) / Z_v   -> ms(u_k) = 0
+        p(!v)  = (1 - p(u_m))(1 - p~) / Z_v
+    then conditional normalisation over children in index order with the sampled
+    child last. Decision is a post-order walk: a leaf fires on eta < p~_v, an
+    interior node on eta < p~_v^res.
+    """
+    batch = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK_N)
+    col_mask = offsets < NUM_NODES
+    row_base = batch * NUM_NODES
+    pool_off = tl.arange(0, BLOCK_POOL)
+    pool_mask = pool_off < POOL_SIZE
+
+    tl.store(
+        predicts_ptr + row_base + offsets,
+        tl.full((BLOCK_N,), -1, dtype=tl.int32),
+        mask=col_mask,
+    )
+    tl.store(
+        accept_index_ptr + row_base + offsets,
+        tl.full((BLOCK_N,), -1, dtype=tl.int32),
+        mask=col_mask,
+    )
+
+    parents = tl.load(parent_indices_ptr + row_base + offsets, mask=col_mask, other=-1)
+    tokens = tl.load(candidates_ptr + row_base + offsets, mask=col_mask, other=0)
+    active = (
+        tl.load(node_mask_ptr + row_base + offsets, mask=col_mask, other=0) != 0
+    ) & col_mask
+    active = active | (offsets == 0)
+    sampled = (
+        tl.load(is_sampled_ptr + row_base + offsets, mask=col_mask, other=0) != 0
+    ) & col_mask
+    lps = tl.load(
+        draft_logprobs_ptr + row_base + offsets, mask=col_mask, other=-float("inf")
+    ).to(tl.float32)
+    tok_safe = tl.minimum(tl.maximum(tokens, 0), VOCAB_SIZE - 1)
+
+    p_tilde = tl.where(offsets == 0, 1.0, 0.0).to(tl.float32)
+    p_res = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    has_kids = offsets < 0
+
+    for v in tl.range(0, NUM_NODES, loop_unroll_factor=1):
+        pt = tl.sum(tl.where(offsets == v, p_tilde, 0.0), axis=0)
+        child_mask = active & (parents == v) & (offsets > 0)
+        n_kids = tl.sum(tl.where(child_mask, 1, 0), axis=0)
+
+        pb = (row_base + v) * POOL_SIZE
+        ids = tl.load(pool_ids_ptr + pb + pool_off, mask=pool_mask, other=0)
+        ids = tl.minimum(tl.maximum(ids, 0), VOCAB_SIZE - 1)
+        ms = tl.load(pool_ms_ptr + pb + pool_off, mask=pool_mask, other=0.0).to(
+            tl.float32
+        )
+        qp = tl.load(
+            target_probs_ptr + (row_base + v) * VOCAB_SIZE + ids,
+            mask=pool_mask,
+            other=0.0,
+        ).to(tl.float32)
+        # Off-pool target mass rides in as p~*(1 - Q_pool): ms is zero there, so
+        # every such x contributes p~*q(x) to Z_v.
+        q_pool = tl.sum(tl.where(pool_mask, qp, 0.0), axis=0)
+        s_pos = tl.sum(
+            tl.where(pool_mask, tl.maximum(pt * qp - ms, 0.0), 0.0), axis=0
+        )
+        z_v = tl.maximum(1.0 - pt + s_pos + pt * (1.0 - q_pool), 1.0e-20)
+
+        um = tl.min(tl.where(child_mask & sampled, offsets, NUM_NODES), axis=0)
+        has_um = um < NUM_NODES
+        um_safe = tl.minimum(tl.maximum(um, 0), NUM_NODES - 1)
+        ms_um = tl.exp(tl.sum(tl.where(offsets == um_safe, lps, 0.0), axis=0))
+        tok_um = tl.sum(tl.where(offsets == um_safe, tok_safe, 0), axis=0)
+        q_um = tl.load(
+            target_probs_ptr + (row_base + v) * VOCAB_SIZE + tok_um
+        ).to(tl.float32)
+        p_um = tl.where(
+            has_um & (ms_um > 0.0),
+            tl.minimum(pt * q_um / tl.maximum(ms_um, 1.0e-20), 1.0),
+            0.0,
+        )
+
+        det_mask = child_mask & (~sampled)
+        q_det = tl.load(
+            target_probs_ptr + (row_base + v) * VOCAB_SIZE + tok_safe,
+            mask=det_mask,
+            other=0.0,
+        ).to(tl.float32)
+        p_det = tl.where(det_mask, pt * q_det * (1.0 - p_um) / z_v, 0.0)
+
+        # Children are tested in index order with the sampled child last, so the
+        # conditional scaling is p(u_j) / (1 - sum_{i<j} p(u_i)).
+        incl = tl.cumsum(p_det, axis=0)
+        prev = incl - p_det
+        pt_det = tl.where(det_mask, p_det / tl.maximum(1.0 - prev, 1.0e-20), 0.0)
+        tot_det = tl.sum(p_det, axis=0)
+        pt_um = tl.where(
+            has_um, p_um / tl.maximum(1.0 - tot_det, 1.0e-20), 0.0
+        )
+
+        upd = tl.where(det_mask, pt_det, pt_um)
+        p_tilde = tl.where(
+            child_mask, tl.minimum(tl.maximum(upd, 0.0), 1.0), p_tilde
+        )
+
+        p_not = (1.0 - p_um) * (1.0 - pt) / z_v
+        total = tot_det + p_um
+        pres_v = tl.minimum(
+            tl.maximum(1.0 - p_not / tl.maximum(1.0 - total, 1.0e-20), 0.0), 1.0
+        )
+        p_res = tl.where(offsets == v, pres_v, p_res)
+        has_kids = has_kids | ((offsets == v) & (n_kids > 0))
+
+    accept = tl.full((), 0, dtype=tl.int64)
+    got = tl.full((), False, dtype=tl.int1)
+    cur = tl.full((), 0, dtype=tl.int64)
+    descending = tl.full((), True, dtype=tl.int1)
+    stopped = tl.full((), False, dtype=tl.int1)
+
+    for _ in tl.range(0, 3 * NUM_NODES, loop_unroll_factor=1):
+        cur_safe = tl.minimum(tl.maximum(cur, 0), NUM_NODES - 1)
+        fc = tl.min(
+            tl.where(active & (parents == cur_safe) & (offsets > 0), offsets, NUM_NODES),
+            axis=0,
+        )
+        live = (~got) & (~stopped)
+        go_down = live & descending & (fc < NUM_NODES)
+        test_now = live & (~descending)
+
+        nonleaf = (
+            tl.sum(tl.where(offsets == cur_safe, has_kids.to(tl.int32), 0), axis=0) != 0
+        )
+        prob = tl.where(
+            nonleaf,
+            tl.sum(tl.where(offsets == cur_safe, p_res, 0.0), axis=0),
+            tl.sum(tl.where(offsets == cur_safe, p_tilde, 0.0), axis=0),
+        )
+        eta = tl.load(uniform_samples_ptr + row_base + cur_safe)
+        fires = test_now & (eta < prob)
+        accept = tl.where(fires, cur, accept)
+        got = got | fires
+
+        # Fill with 0, not -1: a -1 filler sums across the whole block and turns
+        # this into parents[cur] - (BLOCK_N - 1).
+        par = tl.sum(tl.where(offsets == cur_safe, parents, 0), axis=0)
+        ns = tl.min(
+            tl.where(active & (parents == par) & (offsets > cur_safe), offsets, NUM_NODES),
+            axis=0,
+        )
+        has_ns = (ns < NUM_NODES) & (par >= 0)
+        move_sib = test_now & (~fires) & has_ns
+        move_up = test_now & (~fires) & (~has_ns)
+
+        cur = tl.where(go_down, fc, tl.where(move_sib, ns, tl.where(move_up, par, cur)))
+        descending = tl.where(
+            go_down | move_sib,
+            True,
+            tl.where(move_up | (descending & (fc >= NUM_NODES)), False, descending),
+        )
+        stopped = stopped | (move_up & (par < 0))
+
+    accept = tl.minimum(tl.maximum(accept, 0), NUM_NODES - 1)
+    tl.store(accept_leaf_ptr + batch, accept)
+    leaf_depth = tl.load(depths_ptr + row_base + accept).to(tl.int32)
+    tl.store(accept_token_num_ptr + batch, leaf_depth)
+
+    # An interior node fires from its residual, not from q(.|v). Materialise that
+    # distribution so the bonus-token sampler draws the right thing.
+    acc_nonleaf = (
+        tl.sum(tl.where(offsets == accept, has_kids.to(tl.int32), 0), axis=0) != 0
+    )
+    tl.store(residual_valid_ptr + batch, acc_nonleaf.to(tl.int32))
+    pt_acc = tl.sum(tl.where(offsets == accept, p_tilde, 0.0), axis=0)
+    for start in tl.range(0, VOCAB_SIZE, BLOCK_V, loop_unroll_factor=1):
+        voff = start + tl.arange(0, BLOCK_V)
+        vmask = voff < VOCAB_SIZE
+        qv = tl.load(
+            target_probs_ptr + (row_base + accept) * VOCAB_SIZE + voff,
+            mask=vmask,
+            other=0.0,
+        ).to(tl.float32)
+        tl.store(
+            residual_ptr + batch * VOCAB_SIZE + voff,
+            tl.where(acc_nonleaf, pt_acc * qv, 0.0),
+            mask=vmask,
+        )
+    pb = (row_base + accept) * POOL_SIZE
+    ids = tl.load(pool_ids_ptr + pb + pool_off, mask=pool_mask, other=0)
+    ids = tl.minimum(tl.maximum(ids, 0), VOCAB_SIZE - 1)
+    ms = tl.load(pool_ms_ptr + pb + pool_off, mask=pool_mask, other=0.0).to(tl.float32)
+    cur_r = tl.load(
+        residual_ptr + batch * VOCAB_SIZE + ids, mask=pool_mask & acc_nonleaf, other=0.0
+    )
+    tl.store(
+        residual_ptr + batch * VOCAB_SIZE + ids,
+        tl.maximum(cur_r - ms, 0.0),
+        mask=pool_mask & acc_nonleaf,
+    )
+    # Only the deterministic children still PRESENT are covered by their own
+    # allocation. Pruned ones keep their mass here, or it vanishes and the output
+    # distribution drifts.
+    present_det = active & (parents == accept) & (offsets > 0) & (~sampled)
+    tl.store(
+        residual_ptr + batch * VOCAB_SIZE + tok_safe,
+        tl.zeros((BLOCK_N,), dtype=tl.float32),
+        mask=present_det & acc_nonleaf,
+    )
+
+    chain_node = accept
+    for _ in tl.range(0, NUM_NODES, loop_unroll_factor=1):
+        chain_valid = chain_node >= 0
+        chain_safe = tl.minimum(tl.maximum(chain_node, 0), NUM_NODES - 1)
+        chain_depth = tl.load(
+            depths_ptr + row_base + chain_safe, mask=chain_valid, other=0
+        )
+        tl.store(
+            accept_index_ptr + row_base + chain_depth,
+            (row_base + chain_safe).to(tl.int32),
+            mask=chain_valid & (chain_depth < NUM_NODES),
+        )
+        parent = tl.load(
+            parent_indices_ptr + row_base + chain_safe, mask=chain_valid, other=-1
+        )
+        parent_safe = tl.minimum(tl.maximum(parent, 0), NUM_NODES - 1)
+        token = tl.load(
+            candidates_ptr + row_base + chain_safe, mask=chain_valid, other=0
+        )
+        tl.store(
+            predicts_ptr + row_base + parent_safe,
+            token.to(tl.int32),
+            mask=chain_valid & (parent >= 0),
+        )
+        chain_node = tl.where(chain_valid, parent, chain_node)
 
 
 @triton.jit
@@ -1429,6 +1711,9 @@ class WeaverTree(msgspec.Struct):
     # True for the one child per node drawn from the residual draft distribution.
     # Verification needs to tell it apart from its deterministic top-K siblings.
     is_sampled: torch.Tensor
+    # Per-node drafter pool and the residual distribution ms it was sampled from.
+    pool_ids: torch.Tensor
+    pool_ms: torch.Tensor
 
 
 class WeaverTreeCudaGraph(msgspec.Struct):
@@ -1539,6 +1824,9 @@ def _traversal_verify_target_probs(
     draft_logprobs: torch.Tensor,
     target_probs: torch.Tensor,
     uniform_samples: torch.Tensor,
+    is_sampled: Optional[torch.Tensor] = None,
+    pool_ids: Optional[torch.Tensor] = None,
+    pool_ms: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not candidates.is_cuda:
         raise RuntimeError("DFLASH_TFM traversal verification requires CUDA.")
@@ -1571,6 +1859,59 @@ def _traversal_verify_target_probs(
     num_correct = torch.empty((bs,), dtype=torch.int32, device=candidates.device)
     accept_leaf = torch.empty((bs,), dtype=torch.int64, device=candidates.device)
     block_n = triton.next_power_of_2(int(num_nodes))
+    use_univer = (
+        envs.SGLANG_DFLASH_TFM_UNIVER_VERIFY.get()
+        and is_sampled is not None
+        and pool_ids is not None
+        and pool_ms is not None
+    )
+    if use_univer:
+        vocab = int(target_probs.shape[-1])
+        pool_size = int(pool_ids.shape[-1])
+        residual = torch.zeros(
+            (bs, vocab), dtype=torch.float32, device=candidates.device
+        )
+        residual_valid = torch.zeros(
+            (bs,), dtype=torch.int32, device=candidates.device
+        )
+        _univer_verify_kernel[(int(bs),)](
+            candidates.to(torch.int64),
+            parent_indices,
+            depths,
+            node_mask,
+            draft_logprobs,
+            is_sampled.to(device=candidates.device, dtype=torch.bool),
+            pool_ids.to(device=candidates.device, dtype=torch.int64),
+            pool_ms.to(device=candidates.device, dtype=torch.float32),
+            target_probs,
+            uniform_samples,
+            predict,
+            accept_index,
+            num_correct,
+            accept_leaf,
+            residual,
+            residual_valid,
+            NUM_NODES=int(num_nodes),
+            VOCAB_SIZE=vocab,
+            POOL_SIZE=pool_size,
+            BLOCK_N=int(block_n),
+            BLOCK_POOL=int(triton.next_power_of_2(pool_size)),
+            BLOCK_V=1024,
+            num_warps=8,
+        )
+        row_ids = torch.arange(bs, dtype=torch.long, device=candidates.device)
+        dist = target_probs[row_ids, accept_leaf]
+        # An interior node fired from its residual, not from q(.|v); a leaf still
+        # draws its bonus token from the target.
+        rv = residual_valid.bool()
+        rs = residual.sum(dim=1, keepdim=True)
+        dist = torch.where(
+            (rv[:, None]) & (rs > 0), residual / rs.clamp_min(1e-20), dist
+        )
+        bonus = torch.multinomial(dist, 1).squeeze(1)
+        predict[row_ids * num_nodes + accept_leaf] = bonus.to(torch.int32)
+        return predict, accept_index, num_correct, accept_leaf
+
     _weaver_traversal_verify_kernel[(int(bs),)](
         candidates.to(torch.int64),
         parent_indices,
@@ -1610,6 +1951,9 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         parent_indices: Optional[torch.Tensor] = None,
         node_mask: Optional[torch.Tensor] = None,
         draft_logprobs: Optional[torch.Tensor] = None,
+        is_sampled: Optional[torch.Tensor] = None,
+        pool_ids: Optional[torch.Tensor] = None,
+        pool_ms: Optional[torch.Tensor] = None,
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL,
     ):
         super().__init__(
@@ -1633,6 +1977,9 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         self.parent_indices = parent_indices
         self.node_mask = node_mask
         self.draft_logprobs = draft_logprobs
+        self.is_sampled = is_sampled
+        self.pool_ids = pool_ids
+        self.pool_ms = pool_ms
         # Tree-local slot of each request's last accepted node; populated by
         # verify() and consumed by the post-verify Mamba/GDN state commit.
         self.accept_leaf_slots: Optional[torch.Tensor] = None
@@ -1809,6 +2156,9 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             draft_logprobs=self.draft_logprobs,
             target_probs=target_probs,
             uniform_samples=torch.rand_like(candidates, dtype=torch.float32),
+            is_sampled=self.is_sampled,
+            pool_ids=self.pool_ids,
+            pool_ms=self.pool_ms,
         )
         return predict, accept_index, num_correct
 
@@ -2437,7 +2787,11 @@ class DFlashTfmWorker(DFlashWorkerV2):
         draft_logprobs[:, 0] = 0.0
         if node_budget <= 0 or depth <= 0:
             return WeaverTree(
-                tokens, parents, depths, node_mask, draft_logprobs, is_sampled
+                tokens, parents, depths, node_mask, draft_logprobs, is_sampled,
+                torch.zeros((bs, num_nodes, pool_size), dtype=torch.long,
+                            device=device),
+                torch.zeros((bs, num_nodes, pool_size), dtype=torch.float32,
+                            device=device),
             )
 
         expand_width = min(WEAVER_TREE_EXPAND_WIDTH, int(pool_size))
@@ -2492,6 +2846,12 @@ class DFlashTfmWorker(DFlashWorkerV2):
             (bs, frontier_slots), dtype=torch.float32, device=device
         )
         frontier_uniforms.uniform_()
+        node_pool_ids = torch.zeros(
+            (bs, num_nodes, pool_size), dtype=torch.long, device=device
+        )
+        node_pool_ms = torch.zeros(
+            (bs, num_nodes, pool_size), dtype=torch.float32, device=device
+        )
         if device.type != "cuda" or expand_width != 8:
             raise RuntimeError(
                 "Weaver tree construction requires Triton on CUDA with "
@@ -2522,6 +2882,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 frontier_active,
                 frontier_is_sampled,
                 frontier_uniforms,
+                node_pool_ids,
+                node_pool_ms,
                 int(slot_start),
                 WIDTH=int(width),
                 POOL_SIZE=int(pool_size),
@@ -2529,6 +2891,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 DEPTH=int(depth),
                 FRONTIER_SLOTS=int(frontier_slots),
                 BLOCK_POOL=int(block_pool),
+                NUM_NODES=int(num_nodes),
             )
 
         def write_current_slot_cache(
@@ -2736,7 +3099,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
             )
             slot_start = slot_stop
         return WeaverTree(
-            tokens, parents, depths, node_mask, draft_logprobs, is_sampled
+            tokens, parents, depths, node_mask, draft_logprobs, is_sampled,
+            node_pool_ids, node_pool_ms,
         )
 
     def _build_chain_impl(
@@ -3546,6 +3910,9 @@ class DFlashTfmWorker(DFlashWorkerV2):
             parent_indices=tree.parent_indices,
             node_mask=tree.node_mask,
             draft_logprobs=tree.draft_logprobs,
+            is_sampled=tree.is_sampled,
+            pool_ids=tree.pool_ids,
+            pool_ms=tree.pool_ms,
         )
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = verify_input

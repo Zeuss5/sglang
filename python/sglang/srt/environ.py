@@ -699,6 +699,7 @@ class Envs:
     # smaller unit means a wider frontier batch and fewer sequential Weaver
     # calls, trading tree quality for drafting throughput.
     SGLANG_DFLASH_TFM_EXPAND_UNIT = EnvInt(16)
+    SGLANG_DFLASH_TFM_UNIVER_VERIFY = EnvBool(False)
     # Depth bonus beta in the DARTree prefix score s_beta = sum(log q) +
     # beta * depth, applied to the frontier selection priority only. Must be
     # <= 0: a positive bonus makes the score non-monotone along a path, which

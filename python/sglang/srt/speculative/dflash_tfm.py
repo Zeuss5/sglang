@@ -883,23 +883,25 @@ def _univer_verify_kernel(
         ).to(tl.float32)
         p_det = tl.where(det_mask, pt * q_det * (1.0 - p_um) / z_v, 0.0)
 
-        # Children are tested in index order with the sampled child last, so the
-        # conditional scaling is p(u_j) / (1 - sum_{i<j} p(u_i)).
-        incl = tl.cumsum(p_det, axis=0)
-        prev = incl - p_det
-        pt_det = tl.where(det_mask, p_det / tl.maximum(1.0 - prev, 1.0e-20), 0.0)
-        tot_det = tl.sum(p_det, axis=0)
-        pt_um = tl.where(
-            has_um, p_um / tl.maximum(1.0 - tot_det, 1.0e-20), 0.0
+        # The conditional scaling p(u_j)/(1 - sum_{i<j} p(u_i)) must run in the
+        # order the decision phase TESTS the children, which is node-index order.
+        # The sampled child is scored above its siblings so it is selected first
+        # and lands at the LOWEST index -- it is not last. Take the prefix over all
+        # children in index order, wherever the sampled one happens to sit.
+        p_all = tl.where(
+            det_mask, p_det, tl.where((offsets == um_safe) & has_um, p_um, 0.0)
         )
-
-        upd = tl.where(det_mask, pt_det, pt_um)
+        incl = tl.cumsum(p_all, axis=0)
+        prev = incl - p_all
+        pt_all = tl.where(
+            child_mask, p_all / tl.maximum(1.0 - prev, 1.0e-20), 0.0
+        )
         p_tilde = tl.where(
-            child_mask, tl.minimum(tl.maximum(upd, 0.0), 1.0), p_tilde
+            child_mask, tl.minimum(tl.maximum(pt_all, 0.0), 1.0), p_tilde
         )
 
         p_not = (1.0 - p_um) * (1.0 - pt) / z_v
-        total = tot_det + p_um
+        total = tl.sum(p_all, axis=0)
         pres_v = tl.minimum(
             tl.maximum(1.0 - p_not / tl.maximum(1.0 - total, 1.0e-20), 0.0), 1.0
         )

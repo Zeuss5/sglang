@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -740,10 +741,10 @@ def weaver_tree_batch_expand_width(tree_budget: Optional[int] = None) -> int:
     budget = int(tree_budget)
     if budget <= 0:
         return 1
+    expand_unit = max(1, envs.SGLANG_DFLASH_TFM_EXPAND_UNIT.get())
     return max(
         1,
-        (budget + WEAVER_TREE_BATCH_EXPAND_BUDGET_UNIT - 1)
-        // WEAVER_TREE_BATCH_EXPAND_BUDGET_UNIT,
+        (budget + expand_unit - 1) // expand_unit,
     )
 
 
@@ -2570,6 +2571,14 @@ class DFlashTfmWorker(DFlashWorkerV2):
             )
             return torch.gather(slot_ancestors, 1, gather_index)
 
+        # Read once: this is the per-node hot loop.
+        depth_bonus = envs.SGLANG_DFLASH_TFM_DEPTH_BONUS.get()
+        if depth_bonus > 0.0:
+            raise ValueError(
+                "SGLANG_DFLASH_TFM_DEPTH_BONUS must be <= 0; a positive depth "
+                "bonus breaks prefix-closure of the selected tree."
+            )
+
         row_base = batch_indices[:, None]
         slot_start = 1
         while slot_start <= node_budget:
@@ -2577,9 +2586,13 @@ class DFlashTfmWorker(DFlashWorkerV2):
             slot_stop = slot_start + width
             slot_slice = slice(slot_start, slot_stop)
             slot_indices = node_indices[slot_slice]
-            masked_priorities = frontier_scores.masked_fill(
-                ~frontier_active, -torch.inf
-            )
+            priorities = frontier_scores
+            if depth_bonus:
+                # DARTree s_beta: prefix score plus a (non-positive) depth bonus.
+                priorities = priorities + depth_bonus * frontier_depths.to(
+                    priorities.dtype
+                )
+            masked_priorities = priorities.masked_fill(~frontier_active, -torch.inf)
             _, frontier_index = torch.topk(masked_priorities, width, dim=1)
             valid = frontier_active.gather(1, frontier_index)
             token = frontier_tokens.gather(1, frontier_index)

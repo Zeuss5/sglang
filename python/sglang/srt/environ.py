@@ -693,6 +693,17 @@ class Envs:
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)
+    # DFLASH_TFM tree construction. Both defaults reproduce current selection
+    # exactly; they exist to bracket a DARTree-style deferred-selection change.
+    # Nodes expanded per Weaver call are ceil(tree_budget / EXPAND_UNIT), so a
+    # smaller unit means a wider frontier batch and fewer sequential Weaver
+    # calls, trading tree quality for drafting throughput.
+    SGLANG_DFLASH_TFM_EXPAND_UNIT = EnvInt(16)
+    # Depth bonus beta in the DARTree prefix score s_beta = sum(log q) +
+    # beta * depth, applied to the frontier selection priority only. Must be
+    # <= 0: a positive bonus makes the score non-monotone along a path, which
+    # breaks prefix-closure of the selected tree.
+    SGLANG_DFLASH_TFM_DEPTH_BONUS = EnvFloat(0.0)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).

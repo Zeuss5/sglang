@@ -73,6 +73,7 @@ def _weaver_candidate_frontier_kernel(
     FRONTIER_SLOTS: tl.constexpr,
     BLOCK_POOL: tl.constexpr,
     NUM_NODES: tl.constexpr,
+    GREEDY: tl.constexpr,
 ):
     row = tl.program_id(0)
     offsets = tl.arange(0, BLOCK_POOL)
@@ -129,6 +130,39 @@ def _weaver_candidate_frontier_kernel(
         tl.store(frontier_active_ptr + out_index, child_valid)
         tl.store(frontier_is_sampled_ptr + out_index, False)
         scores = tl.where(offsets == top_index, -float("inf"), scores)
+
+    if GREEDY:
+        # Greedy verification does not need a sampled child: q is a point mass, so
+        # s cancels out of the acceptance test and the tree is verified losslessly
+        # either way. A residual draw would only spend a slot that the 8th top-K
+        # token uses better -- measured 7-48% accepted length in simulation.
+        top_value, top_index = tl.max(
+            scores,
+            axis=0,
+            return_indices=True,
+            return_indices_tie_break_left=True,
+        )
+        child_token = tl.load(candidate_ids_ptr + row * POOL_SIZE + top_index)
+        child_valid = parent_active & (child_token >= 0) & (top_value != -float("inf"))
+        norm_lp = top_value - log_denom
+        out_index = child_base + (EXPAND_WIDTH - 1)
+        tl.store(frontier_tokens_ptr + out_index, tl.where(child_valid, child_token, 0))
+        tl.store(
+            frontier_parents_ptr + out_index,
+            tl.where(child_valid, slot_start + row_in_width, 0),
+        )
+        tl.store(frontier_depths_ptr + out_index, tl.where(child_valid, child_depth, 0))
+        tl.store(
+            frontier_scores_ptr + out_index,
+            tl.where(child_valid, parent_score + norm_lp, -float("inf")),
+        )
+        tl.store(
+            frontier_logprobs_ptr + out_index,
+            tl.where(child_valid, norm_lp, -float("inf")),
+        )
+        tl.store(frontier_active_ptr + out_index, child_valid)
+        tl.store(frontier_is_sampled_ptr + out_index, False)
+        return
 
     # `scores` now holds the pool with the deterministic children removed: exactly
     # the residual draft distribution ms. Sample one child from it by inverse CDF.
@@ -1827,6 +1861,7 @@ def _traversal_verify_target_probs(
     is_sampled: Optional[torch.Tensor] = None,
     pool_ids: Optional[torch.Tensor] = None,
     pool_ms: Optional[torch.Tensor] = None,
+    univer_ok: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if not candidates.is_cuda:
         raise RuntimeError("DFLASH_TFM traversal verification requires CUDA.")
@@ -1859,8 +1894,11 @@ def _traversal_verify_target_probs(
     num_correct = torch.empty((bs,), dtype=torch.int32, device=candidates.device)
     accept_leaf = torch.empty((bs,), dtype=torch.int64, device=candidates.device)
     block_n = triton.next_power_of_2(int(num_nodes))
+    # Never on a greedy tree: it has no sampled child, so UniVer's p(u_m) term is
+    # undefined and the cascade is already exactly lossless there.
     use_univer = (
-        envs.SGLANG_DFLASH_TFM_UNIVER_VERIFY.get()
+        univer_ok
+        and envs.SGLANG_DFLASH_TFM_UNIVER_VERIFY.get()
         and is_sampled is not None
         and pool_ids is not None
         and pool_ms is not None
@@ -1954,6 +1992,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         is_sampled: Optional[torch.Tensor] = None,
         pool_ids: Optional[torch.Tensor] = None,
         pool_ms: Optional[torch.Tensor] = None,
+        univer_ok: bool = False,
         capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL,
     ):
         super().__init__(
@@ -1980,6 +2019,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         self.is_sampled = is_sampled
         self.pool_ids = pool_ids
         self.pool_ms = pool_ms
+        self.univer_ok = univer_ok
         # Tree-local slot of each request's last accepted node; populated by
         # verify() and consumed by the post-verify Mamba/GDN state commit.
         self.accept_leaf_slots: Optional[torch.Tensor] = None
@@ -2159,6 +2199,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             is_sampled=self.is_sampled,
             pool_ids=self.pool_ids,
             pool_ms=self.pool_ms,
+            univer_ok=self.univer_ok,
         )
         return predict, accept_index, num_correct
 
@@ -2768,6 +2809,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         candidate_scores: torch.Tensor,
         proposal_features: torch.Tensor,
         token_embed: torch.Tensor,
+        greedy: bool = False,
     ) -> WeaverTree:
         bs, depth, pool_size = candidate_ids.shape
         node_budget = int(self.tree_budget)
@@ -2892,6 +2934,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 FRONTIER_SLOTS=int(frontier_slots),
                 BLOCK_POOL=int(block_pool),
                 NUM_NODES=int(num_nodes),
+                GREEDY=int(bool(greedy)),
             )
 
         def write_current_slot_cache(
@@ -3508,6 +3551,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         candidate_scores: torch.Tensor,
         proposal_features: torch.Tensor,
         token_embed: torch.Tensor,
+        greedy: bool = False,
     ) -> WeaverTreeCudaGraph:
         device = root_ids.device
         if device.type != "cuda":
@@ -3534,6 +3578,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 candidate_scores=candidate_scores_buffer,
                 proposal_features=proposal_features_buffer,
                 token_embed=token_embed,
+                greedy=greedy,
             )
             torch.cuda.synchronize(device)
             graph = torch.cuda.CUDAGraph()
@@ -3546,6 +3591,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                     candidate_scores=candidate_scores_buffer,
                     proposal_features=proposal_features_buffer,
                     token_embed=token_embed,
+                    greedy=greedy,
                 )
             torch.cuda.synchronize(device)
 
@@ -3576,8 +3622,10 @@ class DFlashTfmWorker(DFlashWorkerV2):
         candidate_scores: torch.Tensor,
         proposal_features: torch.Tensor,
         token_embed: torch.Tensor,
+        greedy: bool = False,
     ) -> WeaverTree:
         key = (
+            bool(greedy),
             int(self.tree_budget),
             int(weaver_tree_batch_expand_width(self.tree_budget)),
             root_ids.device.index,
@@ -3607,6 +3655,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         if graph_state is None:
             graph_state = self._capture_weaver_tree_cuda_graph(
                 key=key,
+                greedy=greedy,
                 root_ids=root_ids,
                 output_norm=output_norm,
                 candidate_ids=candidate_ids,
@@ -3634,6 +3683,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         candidate_scores: torch.Tensor,
         proposal_features: torch.Tensor,
         token_embed: torch.Tensor,
+        greedy: bool = False,
     ) -> WeaverTree:
         if root_ids.device.type == "cuda":
             return self._build_tree_with_cuda_graph(
@@ -3644,6 +3694,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 candidate_scores=candidate_scores,
                 proposal_features=proposal_features,
                 token_embed=token_embed,
+                greedy=greedy,
             )
         return self._build_tree_impl(
             root_ids=root_ids,
@@ -3653,6 +3704,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             candidate_scores=candidate_scores,
             proposal_features=proposal_features,
             token_embed=token_embed,
+            greedy=greedy,
         )
 
     def _prepare_for_speculative_decoding(
@@ -3870,6 +3922,13 @@ class DFlashTfmWorker(DFlashWorkerV2):
             batch.spec_info = verify_input
             batch.return_hidden_states = False
             return
+        # Greedy verification is exactly lossless on a pure top-K tree (q is a
+        # point mass, so the draft probability cancels out of the acceptance test),
+        # and a residual-sampled child would only cost accepted length there. So
+        # the sampled child and UniVer are for stochastic sampling only.
+        tree_greedy = (
+            batch.sampling_info is None or batch.sampling_info.is_all_greedy
+        )
         tree = self._build_tree(
             root_ids=draft_input.bonus_tokens.to(torch.long),
             output_norm=draft_input.output_norm,
@@ -3878,6 +3937,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             candidate_scores=candidate_scores,
             proposal_features=proposal_features,
             token_embed=token_embed,
+            greedy=tree_greedy,
         )
         mask_seq_lens_cpu = batch.seq_lens_cpu
         if mask_seq_lens_cpu is None:
@@ -3913,6 +3973,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             is_sampled=tree.is_sampled,
             pool_ids=tree.pool_ids,
             pool_ms=tree.pool_ms,
+            univer_ok=not tree_greedy,
         )
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = verify_input

@@ -129,6 +129,22 @@ class ModelRunnerKVCacheMixin:
 
         return int(rest_memory * (1 << 30))  # return in bytes
 
+    def _reserves_intermediate_ssm(self: ModelRunner) -> bool:
+        """Whether the per-draft-token intermediate SSM cache is really allocated.
+
+        MambaPool zero-sizes that cache whenever the chunk tree-verify path is
+        active — it commits by replaying the accepted path and never keeps a state
+        per draft token. Reserving for it anyway charges
+        `per_req * max_running_requests * num_draft_tokens` against the budget for
+        a tensor of zero bytes: 159 GB at 32 requests x 33 draft tokens, which is
+        enough to make configurations that would fit comfortably fail to start.
+        """
+        from sglang.srt.layers.attention.linear.utils import (
+            gdn_chunk_tree_verify_enabled,
+        )
+
+        return not gdn_chunk_tree_verify_enabled(self.server_args)
+
     def handle_max_mamba_cache(self: ModelRunner, total_rest_memory):
         config = self.mambaish_config
         server_args = self.server_args
@@ -152,12 +168,15 @@ class ModelRunnerKVCacheMixin:
                     // (self.dp_size if server_args.enable_dp_attention else 1),
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * capped_reqs
-                    * server_args.speculative_num_draft_tokens
-                )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                if self._reserves_intermediate_ssm():
+                    intermediate_size = (
+                        config.mamba2_cache_params.mamba_cache_per_req
+                        * capped_reqs
+                        * server_args.speculative_num_draft_tokens
+                    )
+                    total_rest_memory = total_rest_memory - (
+                        intermediate_size / (1 << 30)
+                    )
         elif (
             server_args.disable_radix_cache
             and server_args.max_running_requests is not None
@@ -168,12 +187,15 @@ class ModelRunnerKVCacheMixin:
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
-                intermediate_size = (
-                    config.mamba2_cache_params.mamba_cache_per_req
-                    * server_args.max_mamba_cache_size
-                    * server_args.speculative_num_draft_tokens
-                )
-                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
+                if self._reserves_intermediate_ssm():
+                    intermediate_size = (
+                        config.mamba2_cache_params.mamba_cache_per_req
+                        * server_args.max_mamba_cache_size
+                        * server_args.speculative_num_draft_tokens
+                    )
+                    total_rest_memory = total_rest_memory - (
+                        intermediate_size / (1 << 30)
+                    )
         else:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
@@ -193,7 +215,15 @@ class ModelRunnerKVCacheMixin:
 
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
-                D = server_args.speculative_num_draft_tokens
+                # D is the per-draft-token intermediate depth. Under the chunk
+                # tree-verify path MambaPool allocates none of it, so folding a
+                # non-zero D into the joint solve here shrinks max_mamba_cache_size
+                # for a tensor that is never created.
+                D = (
+                    server_args.speculative_num_draft_tokens
+                    if self._reserves_intermediate_ssm()
+                    else 0
+                )
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.max_mamba_cache_size = int(
                     mamba_budget_bytes // (per_req * (1 + D / ratio))

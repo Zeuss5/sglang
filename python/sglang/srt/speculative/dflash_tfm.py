@@ -2405,7 +2405,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
 class DFlashTfmWorker(DFlashWorkerV2):
     _knobs_logged = False
     _dartree_logged = False
-    _dartree_stats_logged = False
+    _dartree_calls = 0
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: List[int], batch_size: int = 0
     ) -> None:
@@ -3124,8 +3124,11 @@ class DFlashTfmWorker(DFlashWorkerV2):
             torch.gather(c_lp[:, :written], 1, top_idx),
             torch.full_like(top_score, -torch.inf),
         )
-        if not DFlashTfmWorker._dartree_stats_logged:
-            DFlashTfmWorker._dartree_stats_logged = True
+        # Sample a few trees from REAL traffic. Reporting only the first tree
+        # measured a server-warmup tree built on synthetic tokens, which is
+        # identical across configurations and told us nothing about the beam.
+        DFlashTfmWorker._dartree_calls += 1
+        if DFlashTfmWorker._dartree_calls in (200, 800, 2000):
             # Structural report, once. A DARTree tree that silently shrinks looks
             # exactly like a DARTree tree that does not help.
             with torch.no_grad():
@@ -3150,10 +3153,11 @@ class DFlashTfmWorker(DFlashWorkerV2):
                     (node_mask[:, 1:] & ~pmask[:, 1:]).sum().item()
                 )
             logger.info(
-                "DFLASH_TFM DARTree tree: active=%d/%d dropped_no_parent=%d "
+                "DFLASH_TFM DARTree tree[%d]: active=%d/%d dropped_no_parent=%d "
                 "depth_max=%d depth_mean=%.2f topo_violations=%d "
                 "closure_violations=%d",
-                n_active, node_budget, dropped, dmax, dmean, topo_bad, closure_bad,
+                DFlashTfmWorker._dartree_calls, n_active, node_budget, dropped,
+                dmax, dmean, topo_bad, closure_bad,
             )
         return WeaverTree(
             tokens, parents, depths, node_mask, draft_logprobs, is_sampled,

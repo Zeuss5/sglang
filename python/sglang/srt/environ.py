@@ -700,6 +700,10 @@ class Envs:
     # calls, trading tree quality for drafting throughput.
     SGLANG_DFLASH_TFM_EXPAND_UNIT = EnvInt(16)
     SGLANG_DFLASH_TFM_UNIVER_VERIFY = EnvBool(False)
+    SGLANG_DFLASH_TFM_PURE_TOPK = EnvBool(False)
+    SGLANG_DFLASH_TFM_DARTREE = EnvBool(False)
+    SGLANG_DFLASH_TFM_DARTREE_BEAM = EnvInt(8)
+    SGLANG_DFLASH_TFM_NO_TREE_GRAPH = EnvBool(False)
     # Depth bonus beta in the DARTree prefix score s_beta = sum(log q) +
     # beta * depth, applied to the frontier selection priority only. Must be
     # <= 0: a positive bonus makes the score non-monotone along a path, which

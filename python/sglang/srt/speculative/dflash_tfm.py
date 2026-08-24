@@ -84,6 +84,7 @@ def _weaver_candidate_frontier_kernel(
         tl.float32
     )
     scores = tl.where((token_ids >= 0) & pool_mask, scores, -float("inf"))
+    scores_pool = scores  # pristine pool logits; `scores` is consumed by the top-K loop
     parent_score = tl.load(prefix_score_ptr + row)
     parent_depth = tl.load(node_depth_ptr + row)
     parent_active = (tl.load(active_ptr + row) != 0) & (parent_depth < DEPTH)
@@ -185,13 +186,18 @@ def _weaver_candidate_frontier_kernel(
         tl.where(samp_valid, slot_start + row_in_width, 0),
     )
     tl.store(frontier_depths_ptr + out_index, tl.where(samp_valid, child_depth, 0))
-    # Scored just above the best sibling: global frontier selection must never keep a
-    # deterministic child while pruning the sampled one, or the node loses the very
-    # child that makes it verifiable. The offset is tiny so cross-node ordering is
-    # essentially unchanged.
+    # Scored on its OWN pool-relative probability, like any sibling. Scoring it at
+    # the best sibling's logprob (as this once did) does not merely protect it from
+    # pruning -- frontier_scores also decides which node is expanded next, so a
+    # random residual draw was competing for expansion as the node's best child and
+    # the tree grew along random tokens. Losing the sampled child is handled in
+    # verification instead: with no sampled child the node uses Z_v = 1, which makes
+    # UniVer degenerate to membership testing -- lossless, and optimal for a
+    # deterministic candidate set.
+    samp_pool_lp = tl.sum(tl.where(offsets == sel, scores_pool, 0.0), axis=0) - log_denom
     tl.store(
         frontier_scores_ptr + out_index,
-        tl.where(samp_valid, parent_score + best_norm + 1e-3, -float("inf")),
+        tl.where(samp_valid, parent_score + samp_pool_lp, -float("inf")),
     )
     # Stored relative to the RESIDUAL, i.e. this is log ms(u_m) — the denominator
     # UniVer's acceptance term needs, not the full-pool logprob.
@@ -874,6 +880,11 @@ def _univer_verify_kernel(
             tl.minimum(pt * q_um / tl.maximum(ms_um, 1.0e-20), 1.0),
             0.0,
         )
+        # Without a sampled child the node's candidates are a fixed set, and the
+        # optimal lossless rule is membership: emit y ~ q and descend if y is a
+        # child. That is exactly this allocation with Z_v = 1, giving
+        # p(u_k) = p~*q(u_k) and a residual of p~*q elsewhere.
+        z_v = tl.where(has_um, z_v, 1.0)
 
         det_mask = child_mask & (~sampled)
         q_det = tl.load(
@@ -1905,6 +1916,18 @@ def _traversal_verify_target_probs(
         and pool_ids is not None
         and pool_ms is not None
     )
+    if not getattr(_traversal_verify_target_probs, "_logged", False):
+        _traversal_verify_target_probs._logged = True
+        # Emitted once per process. An env var that never reached the container is
+        # otherwise indistinguishable from a null result, and this path decides
+        # whether the run is lossless at all.
+        logger.info(
+            "DFLASH_TFM verify rule: %s (univer_ok=%s knob=%s tensors=%s)",
+            "UniVer" if use_univer else "cascade",
+            univer_ok,
+            envs.SGLANG_DFLASH_TFM_UNIVER_VERIFY.get(),
+            is_sampled is not None and pool_ids is not None and pool_ms is not None,
+        )
     if use_univer:
         vocab = int(target_probs.shape[-1])
         pool_size = int(pool_ids.shape[-1])
@@ -2381,6 +2404,8 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
 
 class DFlashTfmWorker(DFlashWorkerV2):
     _knobs_logged = False
+    _dartree_logged = False
+    _dartree_stats_logged = False
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: List[int], batch_size: int = 0
     ) -> None:
@@ -2799,6 +2824,340 @@ class DFlashTfmWorker(DFlashWorkerV2):
             chain_keys,
             chain_values,
             token_embed,
+        )
+
+
+    def _weaver_expand_for_dartree(
+        self,
+        *,
+        token,
+        node_depth,
+        parent_ancestors,
+        active,
+        row_batch_indices,
+        depth,
+        candidate_ids_rows,
+        candidate_weights_rows,
+        candidate_scores_rows,
+        external_keys,
+        external_values,
+        external_mask,
+        node_keys,
+        node_values,
+        token_embed,
+    ):
+        """One Weaver expansion step over an arbitrary set of nodes.
+
+        Same call as the best-first path makes, but decoupled from that path's
+        contiguous-slot bookkeeping: DARTree expands a beam whose members sit at
+        scattered candidate indices.
+        """
+        depth_index = node_depth.clamp(max=depth - 1)
+        candidate_row_index = row_batch_indices * depth + depth_index
+        row_candidate_ids = candidate_ids_rows[candidate_row_index]
+        logits, current_keys, current_values = self._weaver_indexed_step_compiled(
+            token_ids=torch.where(active, token, torch.zeros_like(token)),
+            candidate_ids=row_candidate_ids,
+            candidate_weights=candidate_weights_rows[candidate_row_index],
+            candidate_scores=candidate_scores_rows[candidate_row_index],
+            external_keys=external_keys,
+            external_values=external_values,
+            external_mask=external_mask,
+            position_ids=depth_index,
+            node_keys=node_keys,
+            node_values=node_values,
+            parent_ancestors=parent_ancestors.reshape(
+                parent_ancestors.shape[0] * parent_ancestors.shape[1], depth
+            ).contiguous(),
+            row_batch_indices=row_batch_indices,
+            token_embed=token_embed,
+        )
+        return logits.float(), row_candidate_ids, current_keys, current_values
+
+    def _build_tree_dartree_impl(
+        self,
+        *,
+        root_ids: torch.Tensor,
+        output_norm: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        candidate_weights: torch.Tensor,
+        candidate_scores: torch.Tensor,
+        proposal_features: torch.Tensor,
+        token_embed: torch.Tensor,
+        greedy: bool = False,
+    ) -> WeaverTree:
+        """DARTree construction: fixed-width depth-wise expansion, deferred top-B.
+
+        Weaver builds best-first: each round takes the global top-w of the frontier,
+        expands them, and the rounds it does not pick are pruned by never being
+        expanded. That decision uses only what is known at that round.
+
+        DARTree instead expands level by level with a fixed beam W, accumulates every
+        candidate it generates, and prunes ONCE at the end with a global top-B. By
+        Lemma 1 that is equivalent to best-first (for beta <= 0, with an ancestor
+        tie-break), so it buys best-first quality at wide-batch cost -- which is the
+        whole point, since the w-sweep showed round time falls monotonically with
+        batch width while tau only degrades past w=4.
+
+        Prefix closure is automatic: score(child) = score(parent) + logprob, and
+        logprob <= 0, so a child never outranks its parent and a global top-B can
+        never select a node without its ancestors.
+
+        KV is only needed for nodes that get EXPANDED (it is produced by the
+        expansion itself and read by descendants' attention), so the cache is sized
+        D*W rather than by the full candidate pool.
+        """
+        bs, depth, pool_size = candidate_ids.shape
+        node_budget = int(self.tree_budget)
+        num_nodes = node_budget + 1
+        device = root_ids.device
+        expand_width = min(WEAVER_TREE_EXPAND_WIDTH, int(pool_size))
+        beam = max(1, int(envs.SGLANG_DFLASH_TFM_DARTREE_BEAM.get()))
+        if not DFlashTfmWorker._dartree_logged:
+            DFlashTfmWorker._dartree_logged = True
+            # Proof in the run log that this path is live. An env var that never
+            # reached the container is otherwise indistinguishable from a null
+            # result -- which has already happened once on this workstream.
+            logger.info(
+                "DFLASH_TFM tree builder: DARTree (beam=%d depth=%d budget=%d "
+                "expand_width=%d)",
+                beam, depth, node_budget, expand_width,
+            )
+        beam = min(beam, node_budget)
+
+        num_layers = self.weaver.num_layers
+        num_heads = self.weaver.num_heads
+        head_dim = self.weaver.d_rank // self.weaver.num_heads
+
+        tokens = torch.zeros((bs, num_nodes), dtype=torch.long, device=device)
+        parents = torch.full((bs, num_nodes), -1, dtype=torch.long, device=device)
+        depths = torch.zeros((bs, num_nodes), dtype=torch.long, device=device)
+        node_mask = torch.zeros((bs, num_nodes), dtype=torch.bool, device=device)
+        draft_logprobs = torch.full(
+            (bs, num_nodes), -torch.inf, dtype=torch.float32, device=device
+        )
+        is_sampled = torch.zeros((bs, num_nodes), dtype=torch.bool, device=device)
+        tokens[:, 0] = root_ids
+        node_mask[:, 0] = True
+        draft_logprobs[:, 0] = 0.0
+        empty_pool_ids = torch.zeros(
+            (bs, num_nodes, pool_size), dtype=torch.long, device=device
+        )
+        empty_pool_ms = torch.zeros(
+            (bs, num_nodes, pool_size), dtype=torch.float32, device=device
+        )
+        if node_budget <= 0 or depth <= 0:
+            return WeaverTree(
+                tokens, parents, depths, node_mask, draft_logprobs, is_sampled,
+                empty_pool_ids, empty_pool_ms,
+            )
+
+        batch_indices = torch.arange(bs, dtype=torch.long, device=device)
+        external_keys, external_values, external_mask = (
+            self.weaver.prompt_external_kv(output_norm[:, None], proposal_features)
+        )
+        candidate_ids_rows = candidate_ids.reshape(bs * depth, pool_size)
+        candidate_weights_rows = candidate_weights.reshape(
+            bs * depth, pool_size, candidate_weights.shape[-1]
+        )
+        candidate_scores_rows = candidate_scores.reshape(bs * depth, pool_size)
+
+        # KV for expanded nodes only: level d occupies beam slots [d*W, (d+1)*W).
+        n_slots = depth * beam + 1
+        node_keys = torch.zeros(
+            (bs, n_slots, num_layers, num_heads, head_dim),
+            dtype=proposal_features.dtype,
+            device=device,
+        )
+        node_values = torch.zeros_like(node_keys)
+        slot_ancestors = torch.full(
+            (bs, n_slots, depth), -1, dtype=torch.long, device=device
+        )
+        slot_ancestors[:, 0, 0] = 0
+
+        # Candidate pool: every node ever generated. No KV -- only expanded nodes
+        # need that, and pruning is deferred so most of these are never expanded.
+        cap = depth * beam * expand_width
+        c_tok = torch.zeros((bs, cap), dtype=torch.long, device=device)
+        c_par = torch.full((bs, cap), -1, dtype=torch.long, device=device)
+        c_dep = torch.zeros((bs, cap), dtype=torch.long, device=device)
+        c_score = torch.full((bs, cap), -torch.inf, dtype=torch.float32, device=device)
+        c_lp = torch.full((bs, cap), -torch.inf, dtype=torch.float32, device=device)
+
+        # Beam state. cand index -1 marks the root.
+        b_cand = torch.full((bs, beam), -1, dtype=torch.long, device=device)
+        b_slot = torch.zeros((bs, beam), dtype=torch.long, device=device)
+        b_tok = root_ids.to(torch.long)[:, None].expand(bs, beam).contiguous()
+        b_dep = torch.zeros((bs, beam), dtype=torch.long, device=device)
+        b_score = torch.zeros((bs, beam), dtype=torch.float32, device=device)
+        b_active = torch.zeros((bs, beam), dtype=torch.bool, device=device)
+        b_active[:, 0] = True                       # level 0 beam is the root alone
+
+        written = 0
+        for level in range(depth):
+            width = beam
+            slot_base = level * beam + 1
+            row_batch_indices = (
+                batch_indices[:, None].expand(bs, width).reshape(bs * width).contiguous()
+            )
+            if level == 0:
+                # The root has no ancestors; slot_ancestors[:, 0, 0] = 0 is the
+                # self-entry descendants read, not an ancestor of the root itself.
+                parent_anc = torch.full(
+                    (bs, width, depth), -1, dtype=torch.long, device=device
+                )
+            else:
+                parent_anc = torch.gather(
+                    slot_ancestors, 1,
+                    b_slot.clamp(min=0, max=n_slots - 1)[:, :, None]
+                    .expand(bs, width, depth),
+                )
+            logits, _row_cand_ids, cur_k, cur_v = self._weaver_expand_for_dartree(
+                token=b_tok.reshape(bs * width),
+                node_depth=b_dep.reshape(bs * width),
+                parent_ancestors=parent_anc,
+                active=b_active.reshape(bs * width),
+                row_batch_indices=row_batch_indices,
+                depth=depth,
+                candidate_ids_rows=candidate_ids_rows,
+                candidate_weights_rows=candidate_weights_rows,
+                candidate_scores_rows=candidate_scores_rows,
+                external_keys=external_keys,
+                external_values=external_values,
+                external_mask=external_mask,
+                node_keys=node_keys,
+                node_values=node_values,
+                token_embed=token_embed,
+            )
+            # This level's expanded nodes take beam slots [slot_base, slot_base+W).
+            if level == 0:
+                # Root KV lands in slot 0, which every descendant attends to.
+                node_keys[:, 0] = cur_k.view(
+                    bs, width, num_layers, num_heads, head_dim)[:, 0]
+                node_values[:, 0] = cur_v.view(
+                    bs, width, num_layers, num_heads, head_dim)[:, 0]
+                b_slot = torch.zeros((bs, width), dtype=torch.long, device=device)
+            else:
+                new_slots = slot_base + torch.arange(width, device=device)
+                node_keys[:, new_slots] = cur_k.view(bs, width, num_layers, num_heads, head_dim)
+                node_values[:, new_slots] = cur_v.view(bs, width, num_layers, num_heads, head_dim)
+                anc = parent_anc.clone()
+                d_idx = b_dep.clamp(max=depth - 1)
+                anc.scatter_(2, d_idx[:, :, None], b_slot[:, :, None])
+                slot_ancestors[:, new_slots] = anc
+                b_slot = new_slots[None, :].expand(bs, width).contiguous()
+
+            lg = torch.log_softmax(logits.float(), dim=-1).view(bs, width, pool_size)
+            top_lp, top_ix = torch.topk(lg, expand_width, dim=-1)
+            child_tok = torch.gather(
+                candidate_ids_rows[
+                    (row_batch_indices * depth
+                     + b_dep.reshape(bs * width).clamp(max=depth - 1))
+                ].view(bs, width, pool_size),
+                2, top_ix,
+            )
+            child_score = b_score[:, :, None] + top_lp
+            child_ok = b_active[:, :, None] & (child_tok >= 0)
+            child_score = torch.where(child_score.isnan(), torch.full_like(child_score, -torch.inf), child_score)
+            child_score = child_score.masked_fill(~child_ok, -torch.inf)
+
+            n_new = width * expand_width
+            sl = slice(written, written + n_new)
+            c_tok[:, sl] = child_tok.reshape(bs, n_new)
+            c_dep[:, sl] = (b_dep[:, :, None] + 1).expand(bs, width, expand_width).reshape(bs, n_new)
+            c_score[:, sl] = child_score.reshape(bs, n_new)
+            c_lp[:, sl] = top_lp.reshape(bs, n_new).masked_fill(
+                ~child_ok.reshape(bs, n_new), -torch.inf
+            )
+            # Parent as a candidate index; -1 means the root.
+            c_par[:, sl] = b_cand[:, :, None].expand(bs, width, expand_width).reshape(bs, n_new)
+            written += n_new
+
+            if level + 1 >= depth:
+                break
+            flat_score = child_score.reshape(bs, n_new)
+            keep = min(beam, n_new)
+            sel_score, sel_ix = torch.topk(flat_score, keep, dim=-1)
+            b_cand = (sel_ix + sl.start)
+            b_tok = torch.gather(c_tok[:, sl], 1, sel_ix)
+            b_dep = torch.gather(c_dep[:, sl], 1, sel_ix)
+            b_score = sel_score
+            b_active = sel_score > -float("inf")
+            if keep < beam:
+                pad = beam - keep
+                z = lambda t, v: torch.cat([t, torch.full((bs, pad), v, dtype=t.dtype, device=device)], 1)
+                b_cand, b_tok, b_dep = z(b_cand, -1), z(b_tok, 0), z(b_dep, 0)
+                b_score = z(b_score, -float("inf"))
+                b_active = z(b_active, False)
+
+        # Deferred pruning: one global top-B over everything generated.
+        take = min(node_budget, written)
+        top_score, top_idx = torch.topk(c_score[:, :written], take, dim=-1)
+        valid = top_score > -float("inf")
+        sel_dep = torch.gather(c_dep[:, :written], 1, top_idx)
+        # Order by depth so parents precede children; the verify kernels require it.
+        order = torch.argsort(sel_dep + torch.where(valid, 0, depth + 1) * (depth + 1), dim=-1, stable=True)
+        top_idx = torch.gather(top_idx, 1, order)
+        valid = torch.gather(valid, 1, order)
+        sel_dep = torch.gather(sel_dep, 1, order)
+
+        slot_of = torch.full((bs, written), -1, dtype=torch.long, device=device)
+        dst = 1 + torch.arange(take, device=device)[None, :].expand(bs, take)
+        slot_of.scatter_(1, top_idx, torch.where(valid, dst, torch.full_like(dst, -1)))
+
+        sel_par = torch.gather(c_par[:, :written], 1, top_idx)
+        par_slot = torch.where(
+            sel_par < 0,
+            torch.zeros_like(sel_par),
+            torch.gather(slot_of, 1, sel_par.clamp(min=0)),
+        )
+        keep_mask = valid & (par_slot >= 0)
+
+        tokens[:, 1 : 1 + take] = torch.where(
+            keep_mask, torch.gather(c_tok[:, :written], 1, top_idx), torch.zeros_like(top_idx)
+        )
+        parents[:, 1 : 1 + take] = torch.where(keep_mask, par_slot, torch.full_like(par_slot, -1))
+        depths[:, 1 : 1 + take] = torch.where(keep_mask, sel_dep, torch.zeros_like(sel_dep))
+        node_mask[:, 1 : 1 + take] = keep_mask
+        draft_logprobs[:, 1 : 1 + take] = torch.where(
+            keep_mask,
+            torch.gather(c_lp[:, :written], 1, top_idx),
+            torch.full_like(top_score, -torch.inf),
+        )
+        if not DFlashTfmWorker._dartree_stats_logged:
+            DFlashTfmWorker._dartree_stats_logged = True
+            # Structural report, once. A DARTree tree that silently shrinks looks
+            # exactly like a DARTree tree that does not help.
+            with torch.no_grad():
+                n_active = int(node_mask[:, 1:].sum(1).float().mean().item())
+                dropped = int(
+                    (valid & (par_slot < 0)).sum(1).float().mean().item()
+                )
+                dmax = int(depths.max().item())
+                dmean = float(
+                    depths[:, 1:][node_mask[:, 1:]].float().mean().item()
+                ) if bool(node_mask[:, 1:].any()) else 0.0
+                # parent[i] < i is required by every downstream verify kernel
+                idx = torch.arange(num_nodes, device=device)[None, :].expand_as(parents)
+                topo_bad = int(
+                    ((parents >= idx) & node_mask).sum().item()
+                )
+                # prefix closure: an active node's parent must be active
+                pmask = torch.gather(
+                    node_mask, 1, parents.clamp(min=0)
+                )
+                closure_bad = int(
+                    (node_mask[:, 1:] & ~pmask[:, 1:]).sum().item()
+                )
+            logger.info(
+                "DFLASH_TFM DARTree tree: active=%d/%d dropped_no_parent=%d "
+                "depth_max=%d depth_mean=%.2f topo_violations=%d "
+                "closure_violations=%d",
+                n_active, node_budget, dropped, dmax, dmean, topo_bad, closure_bad,
+            )
+        return WeaverTree(
+            tokens, parents, depths, node_mask, draft_logprobs, is_sampled,
+            empty_pool_ids, empty_pool_ms,
         )
 
     def _build_tree_impl(
@@ -3687,7 +4046,25 @@ class DFlashTfmWorker(DFlashWorkerV2):
         token_embed: torch.Tensor,
         greedy: bool = False,
     ) -> WeaverTree:
-        if root_ids.device.type == "cuda":
+        if envs.SGLANG_DFLASH_TFM_DARTREE.get():
+            # Not graph-captured yet: DARTree's shapes are static, but the path
+            # needs to be correct before it is baked into a graph.
+            return self._build_tree_dartree_impl(
+                root_ids=root_ids,
+                output_norm=output_norm,
+                candidate_ids=candidate_ids,
+                candidate_weights=candidate_weights,
+                candidate_scores=candidate_scores,
+                proposal_features=proposal_features,
+                token_embed=token_embed,
+                greedy=greedy,
+            )
+        # DARTree currently runs eager, so a graph-captured stock path would be
+        # compared against it unfairly: tree construction is ~15 sequential Weaver
+        # calls plus many small ops per level, which is precisely where launch
+        # overhead dominates. This knob runs stock eager for an apples-to-apples
+        # cost comparison until DARTree is itself captured.
+        if root_ids.device.type == "cuda" and not envs.SGLANG_DFLASH_TFM_NO_TREE_GRAPH.get():
             return self._build_tree_with_cuda_graph(
                 root_ids=root_ids,
                 output_norm=output_norm,
@@ -3928,9 +4305,16 @@ class DFlashTfmWorker(DFlashWorkerV2):
         # point mass, so the draft probability cancels out of the acceptance test),
         # and a residual-sampled child would only cost accepted length there. So
         # the sampled child and UniVer are for stochastic sampling only.
-        tree_greedy = (
+        # Two separate signals. real_greedy decides the VERIFY rule (at T=0 the
+        # cascade is already exactly lossless); tree_greedy decides the tree SHAPE.
+        # Forcing pure top-K at T>0 keeps UniVer on, where the absence of a sampled
+        # child makes every node fall back to Z_v = 1 -- membership testing, which
+        # is lossless and optimal for a fixed candidate set. That isolates tree
+        # quality from the sampled child, which otherwise move together.
+        real_greedy = (
             batch.sampling_info is None or batch.sampling_info.is_all_greedy
         )
+        tree_greedy = real_greedy or envs.SGLANG_DFLASH_TFM_PURE_TOPK.get()
         tree = self._build_tree(
             root_ids=draft_input.bonus_tokens.to(torch.long),
             output_norm=draft_input.output_norm,
@@ -3975,7 +4359,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             is_sampled=tree.is_sampled,
             pool_ids=tree.pool_ids,
             pool_ms=tree.pool_ms,
-            univer_ok=not tree_greedy,
+            univer_ok=not real_greedy,
         )
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.spec_info = verify_input

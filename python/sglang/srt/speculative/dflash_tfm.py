@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import msgspec
 import torch
+import torch._dynamo
 import torch.nn as nn
 import torch.nn.functional as F
 import triton
@@ -2402,6 +2403,22 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         )
 
 
+
+def _raise_dynamo_recompile_limit(minimum: int) -> None:
+    """Ensure Dynamo will tolerate `minimum` recompiles of a static-shape fn.
+
+    Only ever raises the limit. The shape count here is bounded by
+    max_batch_size x distinct expansion widths, so this trades a bounded amount
+    of extra compile time at warmup for not dying at concurrency; it does not
+    make the limit unbounded.
+    """
+    cfg = torch._dynamo.config
+    for attr in ("recompile_limit", "cache_size_limit"):
+        cur = getattr(cfg, attr, None)
+        if isinstance(cur, int) and cur < minimum:
+            setattr(cfg, attr, minimum)
+
+
 class DFlashTfmWorker(DFlashWorkerV2):
     _knobs_logged = False
     _dartree_logged = False
@@ -2700,6 +2717,17 @@ class DFlashTfmWorker(DFlashWorkerV2):
                     token_embed=token_embed,
                 )
 
+            # dynamic=False compiles one graph per input shape, and this
+            # function sees batch_size x expansion_width distinct shapes: the
+            # tree CUDA graphs capture every batch size up to
+            # cuda_graph_max_bs_decode, and the expansion loop's final iteration
+            # is narrower than the rest whenever the budget is not a multiple of
+            # the batch expand width. At c8 with budget 31 that is 8 x 2 = 16
+            # shapes against Dynamo's default recompile_limit of 8, and exceeding
+            # it raises inside the scheduler and kills the server mid-run.
+            # Budget 64 happens to use a single width, which is why c8 worked
+            # there and nowhere else.
+            _raise_dynamo_recompile_limit(256)
             compiled_step = torch.compile(
                 step_fn,
                 fullgraph=True,
@@ -2802,6 +2830,9 @@ class DFlashTfmWorker(DFlashWorkerV2):
                     token_embed=token_embed,
                 )
 
+            # Same bounded-shape exposure as the tree path above; the chain
+            # path is what died first at c8 (budget 15).
+            _raise_dynamo_recompile_limit(256)
             compiled_step = torch.compile(
                 step_fn,
                 fullgraph=True,

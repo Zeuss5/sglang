@@ -14,6 +14,11 @@ WEAVER_CKPT="${WEAVER_CKPT:-/artifacts/weaver/weaver/qwen36_27b_weaver.pth}"
 WEAVER_SHA256="${WEAVER_SHA256:-71f540b143fb6bab14ba724c20e97a72ce198de103cfd228d31c3ce339227833}"
 
 PORT="${PORT:-30000}"
+# reproduction.sh pins these for the paper protocol (c1). Concurrency
+# baselines need them raised; defaults keep the original behaviour.
+MAX_RUNNING="${MAX_RUNNING:-1}"
+MEM_FRACTION="${MEM_FRACTION:-0.75}"
+GRAPH_MAX_BS="${GRAPH_MAX_BS:-32}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:${PORT}}"
 
 usage() {
@@ -77,6 +82,8 @@ cmd_exec() {
     -e SGLANG_DFLASH_TFM_PURE_TOPK="${SGLANG_DFLASH_TFM_PURE_TOPK:-0}" \
     -e SGLANG_DFLASH_TFM_EXPAND_UNIT="${SGLANG_DFLASH_TFM_EXPAND_UNIT:-16}" \
     -e SGLANG_DFLASH_TFM_DEPTH_BONUS="${SGLANG_DFLASH_TFM_DEPTH_BONUS:-0}" \
+    -e SGLANG_DFLASH_TFM_DCUT_PROBE="${SGLANG_DFLASH_TFM_DCUT_PROBE:-0}" \
+    -e SGLANG_DFLASH_TFM_EXPAND_WIDTH="${SGLANG_DFLASH_TFM_EXPAND_WIDTH:-8}" \
     -e SGLANG_DFLASH_TFM_DARTREE="${SGLANG_DFLASH_TFM_DARTREE:-0}" \
     -e SGLANG_DFLASH_TFM_DARTREE_BEAM="${SGLANG_DFLASH_TFM_DARTREE_BEAM:-8}" \
     -e SGLANG_DFLASH_TFM_NO_TREE_GRAPH="${SGLANG_DFLASH_TFM_NO_TREE_GRAPH:-0}" \
@@ -90,8 +97,12 @@ cmd_exec() {
     -e WEAVER_CKPT="$WEAVER_CKPT" \
     -e WEAVER_SHA256="$WEAVER_SHA256" \
     -e PORT="$PORT" \
+    -e MAX_RUNNING="$MAX_RUNNING" \
+    -e MEM_FRACTION="$MEM_FRACTION" \
+    -e GRAPH_MAX_BS="$GRAPH_MAX_BS" \
     -e BASE_URL="$BASE_URL" \
     --ipc=host --network=host --privileged \
+    --name "hydraflash-p${PORT}" \
     "$SGLANG_IMAGE" \
     "$@"
 }
@@ -123,9 +134,9 @@ cmd_serve_ar() {
     --revision "$TARGET_REV" \
     --dtype bfloat16 \
     --tp-size 1 \
-    --max-running-requests 1 \
-    --cuda-graph-max-bs 32 \
-    --mem-fraction-static 0.75 \
+    --max-running-requests "$MAX_RUNNING" \
+    --cuda-graph-max-bs "$GRAPH_MAX_BS" \
+    --mem-fraction-static "$MEM_FRACTION" \
     --page-size 64 \
     --disable-radix-cache \
     --decode-attention-backend trtllm_mha \
@@ -141,9 +152,9 @@ cmd_serve_dflash() {
     --revision "$TARGET_REV" \
     --dtype bfloat16 \
     --tp-size 1 \
-    --max-running-requests 1 \
-    --cuda-graph-max-bs 32 \
-    --mem-fraction-static 0.75 \
+    --max-running-requests "$MAX_RUNNING" \
+    --cuda-graph-max-bs "$GRAPH_MAX_BS" \
+    --mem-fraction-static "$MEM_FRACTION" \
     --page-size 64 \
     --disable-radix-cache \
     --attention-backend trtllm_mha \
@@ -191,9 +202,9 @@ cmd_serve_tfm() {
     --revision "$TARGET_REV" \
     --dtype bfloat16 \
     --tp-size 1 \
-    --max-running-requests 1 \
-    --cuda-graph-max-bs 32 \
-    --mem-fraction-static 0.75 \
+    --max-running-requests "$MAX_RUNNING" \
+    --cuda-graph-max-bs "$GRAPH_MAX_BS" \
+    --mem-fraction-static "$MEM_FRACTION" \
     --page-size 64 \
     --disable-radix-cache \
     --decode-attention-backend trtllm_mha \

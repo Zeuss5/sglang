@@ -1111,6 +1111,18 @@ def _weaver_current_cache_write_kernel(
     out_index = (ancestor_batch * NUM_NODES + ancestor_slot) * DEPTH + ancestor_depth
     tl.store(slot_ancestors_ptr + out_index, ancestor_value, mask=ancestor_mask)
 
+
+def weaver_tree_expand_width() -> int:
+    """Children generated per expanded node.
+
+    Hardcoded to 8 upstream. DARTree (arXiv 2608.13524) reports its results with
+    K=64 candidates per position and W=12 supertree width, so 8 puts us an order of
+    magnitude below the configuration its numbers come from. Exposed so that gap is
+    measurable rather than assumed harmless.
+    """
+    return max(2, envs.SGLANG_DFLASH_TFM_EXPAND_WIDTH.get())
+
+
 def weaver_tree_batch_expand_width(tree_budget: Optional[int] = None) -> int:
     """Weaver expansion batch width: one Weaver call expands this many nodes.
 
@@ -2404,6 +2416,136 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
 
 
 
+
+# --- D-cut potential probe -------------------------------------------------
+# Bole allocates a batch-wide node budget by draft probability, giving request i a
+# variable count q_i instead of the uniform per-request budget used here. Whether
+# that is worth implementing depends entirely on how much requests in one batch
+# actually differ: if every request's marginal (lowest selected) score is similar,
+# a batch-global top-N returns the uniform split and there is nothing to win.
+#
+# This probe records the prefix scores of selected nodes and reports the
+# allocation a global top-N would have produced. Enabled by
+# SGLANG_DFLASH_TFM_DCUT_PROBE; off by default and free when off.
+_DCUT_STATE = {"scores": [], "calls": 0, "reported": 0}
+
+
+def _dcut_probe_active() -> bool:
+    return envs.SGLANG_DFLASH_TFM_DCUT_PROBE.get()
+
+
+def _dcut_record(node_score: torch.Tensor, valid: torch.Tensor) -> None:
+    _DCUT_STATE["scores"].append(
+        torch.where(valid, node_score, torch.full_like(node_score, -float("inf")))
+        .detach()
+    )
+
+
+def _dcut_report(bs: int, node_budget: int) -> None:
+    """Compare uniform per-request allocation against a batch-global top-N."""
+    chunks = _DCUT_STATE["scores"]
+    _DCUT_STATE["scores"] = []
+    if not chunks:
+        return
+    scores = torch.cat(chunks, dim=1)              # [bs, selected]
+    total = bs * node_budget
+    flat = scores.reshape(-1)
+    finite = int((flat > -float("inf")).sum())
+    if finite == 0:
+        return
+    take = min(total, finite)
+    _, idx = torch.topk(flat, take)
+    per_req = torch.bincount(idx // scores.shape[1], minlength=bs).float()
+    # marginal score = lowest selected score per request under the uniform split
+    marg = scores.masked_fill(scores == -float("inf"), float("inf")).min(dim=1).values
+    marg = marg[marg < float("inf")]
+    logger.info(
+        "DFLASH_TFM D-cut probe: bs=%d uniform=%d/req | global top-N per-req "
+        "min=%.1f max=%.1f mean=%.1f std=%.2f | reallocated=%.1f%% | "
+        "marginal score spread=%.3f (min %.3f max %.3f)",
+        bs, node_budget, float(per_req.min()), float(per_req.max()),
+        float(per_req.mean()), float(per_req.std()),
+        float((per_req - node_budget).abs().sum() / (2 * total) * 100),
+        float(marg.max() - marg.min()) if marg.numel() else 0.0,
+        float(marg.min()) if marg.numel() else 0.0,
+        float(marg.max()) if marg.numel() else 0.0,
+    )
+
+
+
+def _resolve_tree_budget(server_args) -> int:
+    """Tree budget, optionally derived from a batch-wide row target.
+
+    Bole (arXiv 2608.01651) calibrates a batch-wide verification budget
+    `B_ver(c) = max{N : T_ver(N|c) <= (1+eps) T_dec(c)}` where N is the TOTAL
+    verified nodes across the batch, and reports +5.3-10.7% from that alone. Our
+    budget is per-request with no total cap, so total nodes grow linearly with
+    concurrency: at c64, budget 31 means 2048 verify tokens, which OOMs on
+    activations at every memory fraction tried (0.75 / 0.72 / 0.70 / 0.68).
+
+    Two policies, both resolved once at startup from max_running_requests --
+    draft_token_num is baked into the CUDA graph capture and cannot vary per step
+    without capturing a graph per size, and graph private pools are precisely what
+    is scarce at high concurrency (8.62 GiB measured at c64).
+
+    SGLANG_DFLASH_TFM_BUDGET_SCHEDULE ("batch:budget,..." , e.g. "1:95,8:31,32:31,
+    64:16") picks the entry for the largest batch <= max_running_requests. This is
+    the measured form and it is what Bole actually specifies: B_ver is calibrated
+    per configuration bucket, not as one number.
+
+    SGLANG_DFLASH_TFM_TARGET_ROWS caps batch * (budget + 1) at a constant instead.
+    Kept for comparison, but our measurements say a CONSTANT row target is the
+    wrong model: the optimal total rows GROWS with batch (96 at c1, 256 at c8,
+    1024 at c32), so a target of 1024 would pick budget 127 at c8 where 31 measures
+    best.
+
+    Tree mode additionally requires num_draft_tokens > block_size, so the floor is
+    block_size + 1 nodes; below that the engine silently falls back to chain
+    verification, which reserves intermediate SSM state and does not fit at c64.
+    """
+    explicit = int(server_args.speculative_dflash_tfm_tree_budget or 128)
+    batch = max(1, int(server_args.max_running_requests or 1))
+    block_size = int(server_args.speculative_dflash_block_size or 16)
+    # Tree mode needs num_draft_tokens > block_size; below that the engine falls
+    # back to chain verification, which reserves intermediate SSM state and does
+    # not fit at c64.
+    floor = block_size
+
+    schedule = envs.SGLANG_DFLASH_TFM_BUDGET_SCHEDULE.get().strip()
+    if schedule:
+        entries = []
+        for part in schedule.split(","):
+            k, _, v = part.partition(":")
+            if not v:
+                raise ValueError(
+                    f"SGLANG_DFLASH_TFM_BUDGET_SCHEDULE entry {part!r} is not "
+                    "batch:budget"
+                )
+            entries.append((int(k), int(v)))
+        entries.sort()
+        chosen = entries[0][1]
+        for b, v in entries:
+            if batch >= b:
+                chosen = v
+        budget = max(floor, min(explicit, chosen))
+        logger.info(
+            "DFLASH_TFM tree budget: %d from schedule %r at batch %d (%d rows)",
+            budget, schedule, batch, batch * (budget + 1),
+        )
+        return budget
+
+    target_rows = envs.SGLANG_DFLASH_TFM_TARGET_ROWS.get()
+    if target_rows <= 0:
+        return explicit
+    budget = max(floor, min(explicit, max(floor + 1, target_rows // batch) - 1))
+    logger.info(
+        "DFLASH_TFM tree budget: %d (explicit %d, target_rows %d, batch %d "
+        "-> %d rows)",
+        budget, explicit, target_rows, batch, batch * (budget + 1),
+    )
+    return budget
+
+
 def _raise_dynamo_recompile_limit(minimum: int) -> None:
     """Ensure Dynamo will tolerate `minimum` recompiles of a static-shape fn.
 
@@ -2465,7 +2607,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             device=self.device,
             dtype=dtype,
         )
-        self.tree_budget = int(self.server_args.speculative_dflash_tfm_tree_budget or 128)
+        self.tree_budget = _resolve_tree_budget(self.server_args)
         requested_pool_size = int(
             self.server_args.speculative_dflash_tfm_candidate_pool_size
             or self.weaver.candidate_pool_size
@@ -2942,7 +3084,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         node_budget = int(self.tree_budget)
         num_nodes = node_budget + 1
         device = root_ids.device
-        expand_width = min(WEAVER_TREE_EXPAND_WIDTH, int(pool_size))
+        expand_width = min(weaver_tree_expand_width(), int(pool_size))
         beam = max(1, int(envs.SGLANG_DFLASH_TFM_DARTREE_BEAM.get()))
         if not DFlashTfmWorker._dartree_logged:
             DFlashTfmWorker._dartree_logged = True
@@ -3232,7 +3374,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
                             device=device),
             )
 
-        expand_width = min(WEAVER_TREE_EXPAND_WIDTH, int(pool_size))
+        expand_width = min(weaver_tree_expand_width(), int(pool_size))
         frontier_slots = (node_budget + 1) * expand_width
         batch_indices = torch.arange(bs, dtype=torch.long, device=device)
         num_layers = self.weaver.num_layers
@@ -3290,10 +3432,14 @@ class DFlashTfmWorker(DFlashWorkerV2):
         node_pool_ms = torch.zeros(
             (bs, num_nodes, pool_size), dtype=torch.float32, device=device
         )
-        if device.type != "cuda" or expand_width != 8:
-            raise RuntimeError(
-                "Weaver tree construction requires Triton on CUDA with "
-                "expand_width=8."
+        if device.type != "cuda":
+            raise RuntimeError("Weaver tree construction requires Triton on CUDA.")
+        if expand_width < 2 or expand_width & (expand_width - 1):
+            # The frontier kernel is written generically in EXPAND_WIDTH
+            # (tl.static_range, child_base * EXPAND_WIDTH), but Triton reductions
+            # want a power of two, and only 8 has ever been exercised.
+            raise ValueError(
+                f"expand_width must be a power of two >= 2, got {expand_width}."
             )
 
         def write_candidate_frontier(
@@ -3493,6 +3639,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 valid, node_depth, torch.zeros_like(node_depth)
             )
             node_mask[:, slot_slice] = valid
+            if _dcut_probe_active():
+                _dcut_record(node_score, valid)
             draft_logprobs[:, slot_slice] = torch.where(
                 valid, node_logprob, torch.full_like(node_logprob, -torch.inf)
             )
@@ -3537,6 +3685,12 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 width,
             )
             slot_start = slot_stop
+        if _dcut_probe_active():
+            _DCUT_STATE["calls"] += 1
+            if _DCUT_STATE["calls"] in (200, 800, 2000):
+                _dcut_report(bs, node_budget)
+            else:
+                _DCUT_STATE["scores"] = []
         return WeaverTree(
             tokens, parents, depths, node_mask, draft_logprobs, is_sampled,
             node_pool_ids, node_pool_ms,

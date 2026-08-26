@@ -1922,9 +1922,16 @@ def _traversal_verify_target_probs(
     block_n = triton.next_power_of_2(int(num_nodes))
     # Never on a greedy tree: it has no sampled child, so UniVer's p(u_m) term is
     # undefined and the cascade is already exactly lossless there.
+    # UniVer is REQUIRED, not optional, whenever the tree carries deterministic
+    # children and verification is stochastic. The cascade's acceptance identity
+    # min(1, cur_p*q/s) is lossless only for candidates DRAWN with probability s
+    # (Traversal Verification, arXiv 2505.12398, Definition 3.1); applied to
+    # top-K children it emits the drafter's argmax and measures TV 0.55-0.73.
+    # Leaving that behind an opt-in knob meant the shipped default was non-lossless
+    # at T>0 while every benchmark script set the knob -- i.e. the measurements were
+    # fine and the artifact was not.
     use_univer = (
         univer_ok
-        and envs.SGLANG_DFLASH_TFM_UNIVER_VERIFY.get()
         and is_sampled is not None
         and pool_ids is not None
         and pool_ms is not None
@@ -1935,11 +1942,19 @@ def _traversal_verify_target_probs(
         # otherwise indistinguishable from a null result, and this path decides
         # whether the run is lossless at all.
         logger.info(
-            "DFLASH_TFM verify rule: %s (univer_ok=%s knob=%s tensors=%s)",
-            "UniVer" if use_univer else "cascade",
+            "DFLASH_TFM verify rule: %s (stochastic=%s tensors=%s)",
+            "UniVer" if use_univer else "cascade (greedy: exactly lossless)",
             univer_ok,
-            envs.SGLANG_DFLASH_TFM_UNIVER_VERIFY.get(),
             is_sampled is not None and pool_ids is not None and pool_ms is not None,
+        )
+    if univer_ok and not use_univer:
+        # Stochastic verification with the cascade is not lossless on this tree.
+        # Fail loudly rather than silently emitting the drafter's argmax.
+        raise RuntimeError(
+            "DFLASH_TFM: stochastic verification requires the UniVer path, but the "
+            "per-node tensors are missing (is_sampled/pool_ids/pool_ms). The "
+            "cascade is only lossless for candidates drawn from the draft "
+            "distribution; on a top-K tree it emits the drafter's argmax."
         )
     if use_univer:
         vocab = int(target_probs.shape[-1])

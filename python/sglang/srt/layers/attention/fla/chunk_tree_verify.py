@@ -801,6 +801,217 @@ def tree_verify_o_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+
+@triton.jit(do_not_specialize=["T"])
+def tree_verify_o_fused_kernel(
+    q,
+    k,
+    v,
+    beta,
+    A_inv,
+    g,
+    ancestor_masks,
+    h0_source,
+    h0_indices,
+    o,
+    scale,
+    T,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+):
+    """tree_verify_o_kernel with recompute_w_u folded in.
+
+    The unfused path materialises two [B, T, H, *] tensors that exist only to be
+    read by the output stage:
+
+        u = A_inv @ (v * beta)                    [B, T, H, V]
+        w = A_inv @ (k * beta * exp(g_path))      [B, T, H, K]
+
+    and the output needs only their combination, which factors:
+
+        u - w @ h0 = A_inv @ [ beta * (v - exp(g_path) * (k @ h0)) ]
+
+    so the bracket is formed per value tile on chip and neither w nor u is ever
+    written. At B=32, T=18, H=48, K=V=128 that removes ~14 MB of live
+    intermediates per GDN layer, x48 layers -- which is the point: CUDA-graph
+    capture memory scales with live per-token intermediates (measured ~4.5 MB per
+    batch x draft token), and that memory is what makes c64 unservable and limits
+    how many graph capacities we can afford.
+
+    Same grid and same output as tree_verify_o_kernel; A_inv is the [T, BT]
+    factor tree_kkt_solve_kernel already produces.
+    """
+    i_v, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    bos = i_b * T
+
+    q += (bos * Hg + i_h // (H // Hg)) * K
+    k += (bos * Hg + i_h // (H // Hg)) * K
+    v += (bos * H + i_h) * V
+    A_inv += (bos * H + i_h) * BT
+    o += (bos * H + i_h) * V
+
+    h0_idx = tl.load(h0_indices + i_b).to(tl.int64)
+    h0_valid = (h0_idx >= 0).to(tl.float32)
+    h0 = h0_source + (tl.maximum(h0_idx, 0) * H + i_h) * V * K
+
+    o_t = tl.arange(0, BT)
+    m_t = o_t < T
+
+    b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    b_qk = tl.zeros([BT, BT], dtype=tl.float32)
+    b_kh0 = tl.zeros([BT, BV], dtype=tl.float32)
+
+    for i_k in range(tl.cdiv(K, BK)):
+        p_q = tl.make_block_ptr(q, (T, K), (Hg * K, 1), (0, i_k * BK), (BT, BK), (1, 0))
+        p_kt = tl.make_block_ptr(k, (T, K), (Hg * K, 1), (0, i_k * BK), (BT, BK), (1, 0))
+        p_h0 = tl.make_block_ptr(
+            h0, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
+        )
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_kt = tl.load(p_kt, boundary_check=(0, 1))
+        b_h0 = (tl.load(p_h0, boundary_check=(0, 1)).to(tl.float32) * h0_valid).to(
+            b_q.dtype
+        )
+        b_o += tl.dot(b_q, tl.trans(b_h0))
+        b_qk += tl.dot(b_q, tl.trans(b_kt))
+        # k @ h0^T for this value tile -- replaces the unfused w @ h0.
+        b_kh0 += tl.dot(b_kt, tl.trans(b_h0))
+
+    p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (0,), (BT,), (0,))
+    b_g = tl.load(p_g, boundary_check=(0,))
+    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (0,), (BT,), (0,))
+    b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+    b_anc = tl.load(ancestor_masks + i_b * BT + o_t, mask=m_t, other=0)
+
+    p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (0, i_v * BV), (BT, BV), (1, 0))
+    b_v = tl.load(p_v, boundary_check=(0, 1)).to(tl.float32)
+
+    # rhs = beta * (v - exp(g_path) * (k @ h0))
+    b_rhs = b_beta[:, None] * (b_v - exp(b_g)[:, None] * b_kh0)
+
+    # (u - w @ h0) = A_inv @ rhs, entirely on chip
+    p_Ai = tl.make_block_ptr(A_inv, (T, BT), (H * BT, 1), (0, 0), (BT, BT), (1, 0))
+    b_Ai = tl.load(p_Ai, boundary_check=(0, 1))
+    b_v_new = tl.dot(b_Ai, b_rhs.to(b_Ai.dtype))
+
+    b_o = b_o * exp(b_g)[:, None]
+    b_qk = b_qk * safe_exp(b_g[:, None] - b_g[None, :])
+    m_path = ((b_anc[:, None] >> o_t[None, :].to(tl.int64)) & 1) != 0
+    m_path |= o_t[:, None] == o_t[None, :]
+    b_qk = tl.where(m_path, b_qk, 0.0)
+
+    b_o = (b_o + tl.dot(b_qk.to(b_v_new.dtype), b_v_new)) * scale
+
+    p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (0, i_v * BV), (BT, BV), (1, 0))
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
+def chunk_gated_delta_rule_tree_verify_fused(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    ancestor_masks,
+    initial_state_source,
+    initial_state_indices,
+    scale=None,
+    use_qk_l2norm_in_kernel: bool = False,
+):
+    """Three-stage plain-path verify: cumsum -> KKT solve -> fused output.
+
+    Identical semantics to chunk_gated_delta_rule_tree_verify, minus the
+    recompute_w_u_fwd stage: the output kernel forms (u - w @ h0) on chip from the
+    KKT factor, so the [B,T,H,K] w and [B,T,H,V] u tensors are never allocated.
+
+    The point is CUDA-graph capture memory, which scales with live per-token
+    intermediates (~4.5 MB per batch x draft token measured from server logs).
+    Whether that translates into a smaller capture line is an END-TO-END question
+    for the server log; do not infer it from a microbenchmark.
+    """
+    B, T, Hg, K = k.shape
+    H, V = v.shape[2], v.shape[3]
+    BT = tree_mask_capacity(T)
+
+    if ancestor_masks.dim() == 3:
+        assert ancestor_masks.shape[-1] == 1 and ancestor_masks.shape[-2] == BT
+        ancestor_masks = ancestor_masks[..., 0]
+    assert q.dtype != torch.float32, "use bfloat16/float16 inputs"
+
+    if scale is None:
+        scale = K**-0.5
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    g = g.contiguous()
+    beta = beta.contiguous()
+
+    g_path = torch.empty_like(g, dtype=torch.float32)
+    tree_path_cumsum_kernel[(B,)](
+        g=g,
+        g_path=g_path,
+        ancestor_masks=ancestor_masks,
+        T=T,
+        H=H,
+        BT=BT,
+        BH=max(16, triton.next_power_of_2(H)),
+    )
+
+    A = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
+    tree_kkt_solve_kernel[(B * H,)](
+        k=k,
+        g=g_path,
+        beta=beta,
+        ancestor_masks=ancestor_masks,
+        A=A,
+        T=T,
+        H=H,
+        Hg=Hg,
+        K=K,
+        BT=BT,
+        BC=16,
+    )
+
+    o = torch.empty_like(v)
+    grid = (triton.cdiv(V, 64), B * H)
+    tree_verify_o_fused_kernel[grid](
+        q=q,
+        k=k,
+        v=v,
+        beta=beta,
+        A_inv=A,
+        g=g_path,
+        ancestor_masks=ancestor_masks,
+        h0_source=initial_state_source,
+        h0_indices=initial_state_indices,
+        o=o,
+        scale=scale,
+        T=T,
+        H=H,
+        Hg=Hg,
+        K=K,
+        V=V,
+        BT=BT,
+        BK=64,
+        BV=64,
+        num_warps=4,
+        # Matches the unfused kernel: the SM100 pipeliner crashes on this
+        # multi-dot K-loop and the loop is only K/BK=2 iterations.
+        num_stages=1,
+    )
+    return o
+
+
 @triton.jit(do_not_specialize=["T"])
 def tree_verify_state_advance_kernel(
     k_stash,

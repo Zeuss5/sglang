@@ -2,10 +2,12 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_tree_verify import (
     advance_ssm_states_along_accept_paths,
     build_tree_ancestor_masks,
     chunk_gated_delta_rule_tree_verify,
+    chunk_gated_delta_rule_tree_verify_fused,
     derive_tree_parent_tokens,
     tree_mask_capacity,
     tree_verify_conv1d_update,
@@ -279,6 +281,7 @@ class GDNKernelDispatcher:
 
 
 class GDNAttnBackend(MambaAttnBackendBase):
+    _fused_wu_logged = False
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
     needs_cpu_seq_lens: bool = False
@@ -810,7 +813,21 @@ class GDNAttnBackend(MambaAttnBackendBase):
         stash.g[layer_ordinal, :bs].copy_(g.view(bs, T, H))
         stash.beta[layer_ordinal, :bs].copy_(beta.view(bs, T, H))
 
-        o = chunk_gated_delta_rule_tree_verify(
+        # The fused variant folds recompute_w_u into the output kernel, so the
+        # [B,T,H,K] w and [B,T,H,V] u intermediates are never allocated. Same
+        # semantics; behind a knob until its equivalence gate has run on GPU.
+        verify_fn = (
+            chunk_gated_delta_rule_tree_verify_fused
+            if envs.SGLANG_GDN_TREE_VERIFY_FUSED_WU.get()
+            else chunk_gated_delta_rule_tree_verify
+        )
+        if not GDNAttnBackend._fused_wu_logged:
+            GDNAttnBackend._fused_wu_logged = True
+            logger.info(
+                "GDN tree verify: %s w/u path",
+                "FUSED" if envs.SGLANG_GDN_TREE_VERIFY_FUSED_WU.get() else "separate",
+            )
+        o = verify_fn(
             q=query.view(bs, T, Hg, K),
             k=key.view(bs, T, Hg, K),
             v=value.view(bs, T, H, V),

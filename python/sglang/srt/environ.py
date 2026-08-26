@@ -706,6 +706,7 @@ class Envs:
     SGLANG_DFLASH_TFM_EXPAND_WIDTH = EnvInt(8)
     SGLANG_DFLASH_TFM_TARGET_ROWS = EnvInt(0)
     SGLANG_DFLASH_TFM_BUDGET_SCHEDULE = EnvStr("")
+    SGLANG_GDN_TREE_VERIFY_FUSED_WU = EnvBool(False)
     SGLANG_DFLASH_TFM_DARTREE_BEAM = EnvInt(8)
     SGLANG_DFLASH_TFM_NO_TREE_GRAPH = EnvBool(False)
     # Depth bonus beta in the DARTree prefix score s_beta = sum(log q) +

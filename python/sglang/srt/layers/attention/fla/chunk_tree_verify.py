@@ -898,7 +898,11 @@ def tree_verify_o_fused_kernel(
     # (u - w @ h0) = A_inv @ rhs, entirely on chip
     p_Ai = tl.make_block_ptr(A_inv, (T, BT), (H * BT, 1), (0, 0), (BT, BT), (1, 0))
     b_Ai = tl.load(p_Ai, boundary_check=(0, 1))
-    b_v_new = tl.dot(b_Ai, b_rhs.to(b_Ai.dtype))
+    # Cast back to the input dtype: the unfused path materialises u in bf16 and
+    # does the final (masked QK) @ (u - w h0) product in bf16, so keeping this in
+    # fp32 would both change numerics relative to the reference and force a slow
+    # fp32 tl.dot.
+    b_v_new = tl.dot(b_Ai, b_rhs.to(b_Ai.dtype)).to(b_Ai.dtype)
 
     b_o = b_o * exp(b_g)[:, None]
     b_qk = b_qk * safe_exp(b_g[:, None] - b_g[None, :])

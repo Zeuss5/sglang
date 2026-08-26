@@ -2,6 +2,8 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+import logging
+
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_tree_verify import (
     advance_ssm_states_along_accept_paths,
@@ -67,6 +69,9 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+
+
+logger = logging.getLogger(__name__)
 
 
 class GDNKernelDispatcher:

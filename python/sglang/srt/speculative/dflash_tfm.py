@@ -2240,6 +2240,22 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                     sampling_info.top_ps, self.draft_token_num, dim=0
                 ),
             )
+        if getattr(sampling_info, "need_min_p_sampling", False):
+            # Losslessness is a statement about ONE distribution: the verifier must
+            # score against exactly what the sampler would have drawn from. sampler.py
+            # applies min_p (see Sampler.forward, need_min_p_sampling branch), so
+            # omitting it here silently verifies against a different target -- the
+            # request stays lossless w.r.t. a distribution nobody asked for.
+            min_ps = torch.repeat_interleave(
+                sampling_info.min_ps, self.draft_token_num, dim=0
+            )
+            thresh = min_ps.unsqueeze(-1) * target_probs.max(dim=-1, keepdim=True).values
+            target_probs = torch.where(
+                target_probs >= thresh, target_probs, 0.0
+            )
+            target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True).clamp_min(
+                1e-12
+            )
         target_probs = target_probs.view(bs, self.draft_token_num, -1)
         predict, accept_index, num_correct, _ = _traversal_verify_target_probs(
             candidates=candidates.to(torch.int64),

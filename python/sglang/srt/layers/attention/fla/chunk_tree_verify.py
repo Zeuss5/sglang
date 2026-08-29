@@ -1072,7 +1072,10 @@ def tree_verify_o_replay_kernel(
             rp_k + (slot * Hg + i_h // (H // Hg)) * L_true * K,
             (L_true, K), (K, 1), (0, i_k * BK), (L, BK), (1, 0),
         )
-        b_rk = tl.load(p_rk, boundary_check=(0, 1))
+        # The ring lives in the SSM dtype (fp32 here), q/k in bf16. Cast to the
+        # query dtype so the dots stay on the tensor cores at the same precision
+        # as the rest of the kernel -- mixing dtypes is a hard error in tl.dot.
+        b_rk = tl.load(p_rk, boundary_check=(0, 1)).to(q.dtype.element_ty)
         b_qkb += tl.dot(b_q, tl.trans(b_rk))
         b_kkb += tl.dot(b_kt, tl.trans(b_rk))
 
@@ -1081,13 +1084,13 @@ def tree_verify_o_replay_kernel(
         rp_d + (slot * H + i_h) * L_true * V,
         (L_true, V), (V, 1), (0, i_v * BV), (L, BV), (1, 0),
     )
-    b_rd = tl.load(p_rd, boundary_check=(0, 1))
+    b_rd = tl.load(p_rd, boundary_check=(0, 1)).to(q.dtype.element_ty)
 
     # Spre products = decayed checkpoint + decay-weighted replay.
     b_qkb = tl.where(m_l[None, :], b_qkb * w_j[None, :], 0.0)
     b_kkb = tl.where(m_l[None, :], b_kkb * w_j[None, :], 0.0)
-    b_o = b_o * p_h + tl.dot(b_qkb.to(b_rd.dtype), b_rd)
-    b_kh0 = b_kh0 * p_h + tl.dot(b_kkb.to(b_rd.dtype), b_rd)
+    b_o = b_o * p_h + tl.dot(b_qkb.to(q.dtype.element_ty), b_rd)
+    b_kh0 = b_kh0 * p_h + tl.dot(b_kkb.to(q.dtype.element_ty), b_rd)
 
     p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (0,), (BT,), (0,))
     b_g = tl.load(p_g, boundary_check=(0,))

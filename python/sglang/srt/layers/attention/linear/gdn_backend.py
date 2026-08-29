@@ -7,10 +7,12 @@ import logging
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.fla.chunk_tree_verify import (
     advance_ssm_states_along_accept_paths,
+    append_ssm_inputs_along_accept_paths,
     build_tree_ancestor_masks,
     chunk_gated_delta_rule_tree_verify,
     chunk_gated_delta_rule_tree_verify_fused,
     chunk_gated_delta_rule_tree_verify_neumann,
+    chunk_gated_delta_rule_tree_verify_replay,
     derive_tree_parent_tokens,
     tree_mask_capacity,
     tree_verify_conv1d_update,
@@ -840,8 +842,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # semantics; behind a knob until its equivalence gate has run on GPU.
         # Bole's Neumann path drops the KKT solve and recompute_w_u entirely, so
         # it is selected ahead of the w/u fusion (which only removes the latter).
+        # ReplaySSM reconstructs the pre-tree state from (checkpoint, ring) rather
+        # than reading a folded tensor, which is what lets the COMMIT append inputs
+        # instead of storing 8dn of state. It requires the ring buffers, so it only
+        # engages when --enable-linear-replayssm allocated them.
+        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        rp_d = getattr(layer_cache, "replayssm_d", None)
+        rp_k = getattr(layer_cache, "replayssm_k", None)
+        rp_g = getattr(layer_cache, "replayssm_g", None)
+        rp_pos = self.forward_metadata.replayssm_write_pos
+        use_replay = (
+            rp_d is not None and rp_k is not None and rp_g is not None
+            and rp_pos is not None
+        )
         use_neumann = envs.SGLANG_GDN_TREE_VERIFY_NEUMANN.get()
-        if use_neumann:
+        if use_replay:
+            verify_fn = chunk_gated_delta_rule_tree_verify_replay
+        elif use_neumann:
             verify_fn = chunk_gated_delta_rule_tree_verify_neumann
         elif envs.SGLANG_GDN_TREE_VERIFY_FUSED_WU.get():
             verify_fn = chunk_gated_delta_rule_tree_verify_fused
@@ -851,12 +868,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
             GDNAttnBackend._fused_wu_logged = True
             logger.info(
                 "GDN tree verify: %s path (max_tree_depth=%s)",
-                "BOLE-NEUMANN"
+                "REPLAYSSM"
+                if use_replay
+                else "BOLE-NEUMANN"
                 if use_neumann
                 else ("FUSED w/u" if envs.SGLANG_GDN_TREE_VERIFY_FUSED_WU.get() else "separate w/u"),
                 self._max_tree_depth,
             )
-        extra = {"max_tree_depth": self._max_tree_depth} if use_neumann else {}
+        if use_replay:
+            extra = {
+                "max_tree_depth": self._max_tree_depth,
+                "replay_d": rp_d,
+                "replay_k": rp_k,
+                "replay_g": rp_g,
+                "replay_pos": rp_pos,
+            }
+        elif use_neumann:
+            extra = {"max_tree_depth": self._max_tree_depth}
+        else:
+            extra = {}
+        self._tree_verify_used_replay = use_replay
         o = verify_fn(
             **extra,
             q=query.view(bs, T, Hg, K),
@@ -882,6 +913,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
         stash = self.tree_verify_stash
         assert stash is not None, "no tree verify forward preceded the state commit"
         bs = last_correct_steps.shape[0]
+        # ReplaySSM commit: append the accepted path's inputs to the ring instead of
+        # storing the full state. Only valid if the verify that preceded it read
+        # from the ring -- otherwise the ring and the state would describe different
+        # histories and the next verify would replay a window onto a checkpoint that
+        # already contains it.
+        if getattr(self, "_tree_verify_used_replay", False):
+            # The FULL per-layer tensors, not a single layer's view: this kernel's
+            # grid iterates layers, and a per-layer view would funnel every layer's
+            # inputs into layer 0's ring.
+            mc = self.req_to_token_pool.mamba_pool.mamba_cache
+            append_ssm_inputs_along_accept_paths(
+                k_stash=stash.k,
+                v_stash=stash.v,
+                g_stash=stash.g,
+                beta_stash=stash.beta,
+                ssm_states=mc.temporal,
+                replay_d=mc.replayssm_d,
+                replay_k=mc.replayssm_k,
+                replay_g=mc.replayssm_g,
+                replay_pos=self.forward_metadata.replayssm_write_pos,
+                cache_indices=self.forward_metadata.mamba_cache_indices[:bs],
+                ancestor_masks=stash.ancestor_masks,
+                last_correct_steps=last_correct_steps,
+                T=stash.T,
+                Hg=stash.Hg,
+                K=stash.K,
+                V=stash.V,
+                spec_window=stash.T,
+            )
+            return
         advance_ssm_states_along_accept_paths(
             k_stash=stash.k,
             v_stash=stash.v,

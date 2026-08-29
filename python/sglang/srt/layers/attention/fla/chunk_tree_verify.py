@@ -1672,6 +1672,9 @@ def tree_verify_state_append_kernel(
     stride_gl,
     stride_bl,
     stride_sl,
+    stride_rdl,          # per-LAYER stride of the ring buffers. The grid iterates
+    stride_rkl,          # layers, so omitting these writes every layer's inputs
+    stride_rgl,          # into layer 0's ring.
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
@@ -1708,6 +1711,10 @@ def tree_verify_state_append_kernel(
 
     slot = tl.load(cache_indices + i_n).to(tl.int64)
     leaf = tl.load(last_correct_steps + i_n).to(tl.int64)
+
+    rp_d += i_l * stride_rdl
+    rp_k += i_l * stride_rkl
+    rp_g += i_l * stride_rgl
 
     o_w = tl.arange(0, NW)
     b_anc = tl.load(ancestor_masks + (i_n * BT + leaf) * NW + o_w)
@@ -1781,11 +1788,10 @@ def tree_verify_state_append_kernel(
     if will_flush:
         # Fold everything into the checkpoint and empty the ring.
         tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
-        if i_v == 0 and i_hv == 0 and i_l == 0:
-            tl.store(rp_pos + i_n, 0)
-    else:
-        if i_v == 0 and i_hv == 0 and i_l == 0:
-            tl.store(rp_pos + i_n, w)
+    # rp_pos is per-request and SHARED across layers, so exactly one program may
+    # write it -- every layer computes the same value from the same inputs.
+    if i_v == 0 and i_hv == 0 and i_l == 0:
+        tl.store(rp_pos + i_n, tl.where(will_flush, 0, w))
 
 
 def append_ssm_inputs_along_accept_paths(
@@ -1820,6 +1826,8 @@ def append_ssm_inputs_along_accept_paths(
     BT, NW = ancestor_masks.shape[-2], ancestor_masks.shape[-1]
     assert NW == BT // 64 and T <= BT, (BT, NW, T)
     L_ring = replay_g.shape[-1]
+    # Accept either a single layer's view or the full per-layer tensor; the grid
+    # covers layers, so the full tensor is what the backend should pass.
     BK = triton.next_power_of_2(K)
     BV = min(triton.next_power_of_2(V), 32)
     grid = (L, triton.cdiv(V, BV), B * H)
@@ -1843,6 +1851,9 @@ def append_ssm_inputs_along_accept_paths(
         stride_gl=g_stash.stride(0),
         stride_bl=beta_stash.stride(0),
         stride_sl=ssm_states.stride(0),
+        stride_rdl=replay_d.stride(0) if replay_d.dim() == 5 else 0,
+        stride_rkl=replay_k.stride(0) if replay_k.dim() == 5 else 0,
+        stride_rgl=replay_g.stride(0) if replay_g.dim() == 4 else 0,
         H=H,
         Hg=Hg,
         K=K,

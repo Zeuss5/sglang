@@ -2381,41 +2381,88 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                 batch, logits_output, sampling_info
             )
 
-        accept_index_cpu = accept_index.tolist()
-        predict_cpu = predict.tolist()
-        commit_lens_cpu: List[int] = []
-        num_correct_cpu: List[int] = []
-        out_tokens_cpu: List[List[int]] = []
-        for row in accept_index_cpu:
-            row_tokens: List[int] = []
-            for idx in row:
-                if idx == -1:
-                    break
-                row_tokens.append(int(predict_cpu[int(idx)]))
-            if not row_tokens:
+        # Accept-path extraction, vectorised. This used to be two blocking
+        # .tolist() syncs followed by a bs x draft_token_num Python loop, and then
+        # out_tokens was rebuilt on device ROW BY ROW -- bs separate H2D copies.
+        # A profile put GPU idle at 19.1% of wall time at c32, and this round trip
+        # is the largest identified contributor.
+        #
+        # Semantics preserved exactly: the old loop broke at the FIRST -1, so a row
+        # is the prefix before it, not every non-negative entry. `argmax` on the
+        # boolean gives that first index; rows with no -1 take the full width.
+        _loop_verify = envs.SGLANG_DFLASH_TFM_LOOP_VERIFY.get()
+        if not DFlashTfmWorker._accept_path_logged:
+            DFlashTfmWorker._accept_path_logged = True
+            # Provenance in the run log. An env var passed with docker -e never
+            # appears in server_args, so grepping for it cannot tell the arms
+            # apart -- a check that reports the same thing either way.
+            logger.info(
+                "DFLASH_TFM accept-path extraction: %s",
+                "LEGACY host loop" if _loop_verify else "VECTORISED",
+            )
+        if _loop_verify:
+            # Legacy host-loop extraction, kept ONLY so the vectorised path can be
+            # measured against it at matched seeds. A cross-seed comparison is
+            # worthless here: the same config swings ~9% on ShareGPT sampling.
+            accept_index_cpu = accept_index.tolist()
+            predict_cpu = predict.view(-1).tolist()
+            commit_lens_cpu = []
+            out_rows = []
+            for row in accept_index_cpu:
+                row_tokens = []
+                for idx in row:
+                    if idx == -1:
+                        break
+                    row_tokens.append(int(predict_cpu[int(idx)]))
+                if not row_tokens:
+                    raise RuntimeError(
+                        "DFlash+Weaver verify produced an empty accept path."
+                    )
+                commit_lens_cpu.append(len(row_tokens))
+                out_rows.append(row_tokens)
+            num_correct_cpu = [max(0, n - 1) for n in commit_lens_cpu]
+            commit_lens = torch.tensor(
+                commit_lens_cpu, dtype=torch.int32, device=batch.device
+            )
+            out_tokens = torch.zeros(
+                (bs, self.draft_token_num), dtype=torch.int64, device=batch.device
+            )
+            for i, row_tokens in enumerate(out_rows):
+                out_tokens[i, : len(row_tokens)] = torch.tensor(
+                    row_tokens, dtype=torch.int64, device=batch.device
+                )
+        else:
+            T_draft = accept_index.shape[1]
+            is_invalid = accept_index == -1
+            has_invalid = is_invalid.any(dim=1)
+            first_invalid = torch.where(
+                has_invalid,
+                is_invalid.to(torch.uint8).argmax(dim=1),
+                torch.full_like(has_invalid, T_draft, dtype=torch.long),
+            )
+            commit_lens = first_invalid.to(torch.int32)
+            valid_mask = (
+                torch.arange(T_draft, device=accept_index.device)[None, :]
+                < first_invalid[:, None]
+            )
+            gathered = predict.view(-1)[accept_index.clamp(min=0)]
+            out_tokens = torch.where(
+                valid_mask, gathered, torch.zeros_like(gathered)
+            ).to(torch.int64)
+
+            # ONE small sync, of bs values, for the bookkeeping that genuinely
+            # needs host-side lengths (page_size>1 commit, seq_lens accounting).
+            commit_lens_cpu = commit_lens.tolist()
+            if min(commit_lens_cpu) == 0:
                 raise RuntimeError(
                     "DFlash+Weaver verify produced an empty accept path."
                 )
-            commit_lens_cpu.append(len(row_tokens))
-            num_correct_cpu.append(max(0, len(row_tokens) - 1))
-            out_tokens_cpu.append(row_tokens)
-
-        commit_lens = torch.tensor(
-            commit_lens_cpu, dtype=torch.int32, device=batch.device
-        )
+            num_correct_cpu = [max(0, n - 1) for n in commit_lens_cpu]
         row_ids = torch.arange(bs, device=batch.device, dtype=torch.long)
         self.accept_leaf_slots = (
             accept_index[row_ids, commit_lens.to(torch.long) - 1].to(torch.long)
             - row_ids * self.draft_token_num
         )
-        out_tokens = torch.zeros(
-            (bs, self.draft_token_num), dtype=torch.int64, device=batch.device
-        )
-        for i, row_tokens in enumerate(out_tokens_cpu):
-            out_tokens[i, : len(row_tokens)] = torch.tensor(
-                row_tokens, dtype=torch.int64, device=batch.device
-            )
-
         out_cache_loc = batch.out_cache_loc
         out_cache_loc_2d = out_cache_loc.view(bs, self.draft_token_num)
         if bs == 1:
@@ -2662,6 +2709,7 @@ def _raise_dynamo_recompile_limit(minimum: int) -> None:
 class DFlashTfmWorker(DFlashWorkerV2):
     _knobs_logged = False
     _dartree_logged = False
+    _accept_path_logged = False
     _dartree_calls = 0
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: List[int], batch_size: int = 0

@@ -706,6 +706,9 @@ class Envs:
     # Empirical losslessness audit: compares the observed root accept rate against
     # the value losslessness forces, sum_{c in C} p_target(c). Any persistent
     # positive gap is a proof of leakage. Off by default.
+    # Legacy host-loop accept-path extraction. Kept only to measure the
+    # vectorised path against it at matched seeds.
+    SGLANG_DFLASH_TFM_LOOP_VERIFY = EnvBool(False)
     SGLANG_DFLASH_TFM_LOSSLESS_AUDIT = EnvBool(False)
     SGLANG_DFLASH_TFM_LOSSLESS_AUDIT_EVERY = EnvInt(2000)
     SGLANG_DFLASH_TFM_EXPAND_WIDTH = EnvInt(8)

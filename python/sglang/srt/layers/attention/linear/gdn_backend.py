@@ -942,6 +942,29 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 V=stash.V,
                 spec_window=stash.T,
             )
+            # Persist the device-updated cursor back to the pool. The append
+            # kernel wrote the new position into the per-request snapshot; without
+            # this the next step would re-read the pre-verify cursor and replay a
+            # window that has already been committed.
+            mamba_pool = self.req_to_token_pool.mamba_pool
+            write_pos_buf = getattr(mamba_pool, "replayssm_write_pos", None)
+            if write_pos_buf is not None:
+                slots = self.forward_metadata.mamba_cache_indices[:bs].to(torch.long)
+                valid = slots >= 0
+                if valid.any():
+                    uniq, inv = torch.unique(slots[valid], return_inverse=True)
+                    vals = torch.empty(
+                        uniq.shape[0],
+                        dtype=write_pos_buf.dtype,
+                        device=write_pos_buf.device,
+                    )
+                    # Slice to bs BEFORE masking: the metadata cursor is sized for
+                    # the padded graph batch (e.g. 32) while bs comes from the
+                    # accepted-steps tensor (e.g. 31), and masking the unsliced
+                    # tensor with a bs-length mask is an IndexError under load.
+                    wp = self.forward_metadata.replayssm_write_pos[:bs]
+                    vals[inv] = wp[valid].to(write_pos_buf.dtype)
+                    write_pos_buf[uniq] = vals
             return
         advance_ssm_states_along_accept_paths(
             k_stash=stash.k,

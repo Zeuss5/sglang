@@ -1296,8 +1296,12 @@ def chunk_gated_delta_rule_tree_verify_replay(
 
     terms = int(max_tree_depth) if max_tree_depth is not None else NEUMANN_DEFAULT_TERMS
     terms = max(1, min(terms, int(T) - 1))
+    # BV=64 for the replay path, unlike the Neumann path's BV=V. Measured 0.159 ms
+    # against 0.179 at BV=128 (warps=4). This kernel carries more live tiles --
+    # b_qkb, b_kkb and b_rd on top of the usual set -- so halving b_o and b_kh0
+    # relieves more pressure than the extra per-tile ring work costs back.
     if BV is None:
-        BV = V if V <= 128 else 64
+        BV = 64
 
     o = torch.empty_like(v)
     grid = (triton.cdiv(V, BV), B * H)
@@ -1306,10 +1310,13 @@ def chunk_gated_delta_rule_tree_verify_replay(
         h0_source=initial_state_source, h0_indices=initial_state_indices,
         rp_d=replay_d, rp_k=replay_k, rp_g=replay_g, rp_pos=replay_pos,
         o=o, scale=scale, T=T, L_true=L, H=H, Hg=Hg, K=K, V=V,
-        # Pad the buffer axis to 64: a tl.dot with N=16 is below the tensor-core
-        # tile and was measurably wrong on this target (20% error on the replay
-        # term while the checkpoint term was exact). Masking keeps it correct.
-        L=max(64, triton.next_power_of_2(L)), BT=BT, BK=64, BV=BV,
+        # Buffer axis at its true power-of-two extent. An earlier version padded
+        # this to 64 on the theory that a tl.dot with N=16 was miscomputing; that
+        # was wrong (the bug was safe_exp zeroing the newest entry), and the
+        # padding survived as pure waste -- 4x the ring load and 4x-wide dots for
+        # a 16-entry ring. Profiling showed the kernel's cost was FLAT in ring
+        # occupancy, which is the signature of paying for the block, not the data.
+        L=triton.next_power_of_2(L), BT=BT, BK=64, BV=BV,
         NEUMANN_TERMS=terms, num_warps=num_warps, num_stages=num_stages,
     )
     return o

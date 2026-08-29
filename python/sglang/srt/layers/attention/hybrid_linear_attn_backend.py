@@ -252,6 +252,25 @@ class MambaAttnBackendBase(AttentionBackend):
             and forward_batch.mamba_track_mask.any()
         )
 
+        # ReplaySSM on the VERIFY path. Added AFTER the mode chain rather than as
+        # another branch in it: target verify is handled by the extend branch,
+        # which sets query_start_loc, and preempting it left that unbound.
+        #
+        # Snapshot the ring cursor only -- do NOT advance it here. Decode advances
+        # by exactly one per step, which the host can predict. A verify step
+        # advances by the ACCEPTED COUNT, unknown until the tree is verified, so
+        # the commit kernel writes the cursor on device and the GDN backend
+        # persists it afterwards. Advancing it here would require the accepted
+        # counts back on the host every step -- the synchronisation ReplaySSM's
+        # design exists to avoid.
+        if replayssm_write_pos is None and forward_batch.forward_mode.is_target_verify():
+            _pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+            _wp = getattr(_pool, "replayssm_write_pos", None) if _pool is not None else None
+            if _wp is not None:
+                replayssm_write_pos = _wp[
+                    mamba_cache_indices.to(torch.long).clamp(min=0)
+                ].clone()
+
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,

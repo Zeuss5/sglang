@@ -949,6 +949,180 @@ def tree_verify_o_neumann_kernel(
 
 
 @triton.jit(do_not_specialize=["T"])
+def tree_verify_o_replay_kernel(
+    q,
+    k,
+    v,
+    beta,
+    g,
+    ancestor_masks,
+    h0_source,
+    h0_indices,
+    rp_d,          # [num_slots, HV, L, V] ring buffer: correction terms u
+    rp_k,          # [num_slots, H,  L, K] ring buffer: keys
+    rp_g,          # [num_slots, HV, L]    ring buffer: log decays (fp32)
+    rp_pos,        # [B] int32 ring cursor: number of valid entries
+    o,
+    scale,
+    T,
+    L_true,        # actual ring length; block extent below is padded separately
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    L: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    NEUMANN_TERMS: tl.constexpr,
+):
+    """Tree verify that REPLAYS a ring buffer instead of reading a folded state.
+
+    ReplaySSM (Dao AI Lab, 2026) caches SSM *inputs* rather than state. The commit
+    after each verify step appends the accepted path's (u, k, g) to a ring buffer
+    and only materialises a full checkpoint every L steps, so the per-step 8dn
+    state store becomes a ~2(d+n+1) append. The post is explicit that this is what
+    the tree case needs: "the ring buffer with indexing is also important for
+    tree-based speculative decoding, where accepted tokens are no longer
+    contiguous in the buffer", and that during verification "each draft query reads
+    from the same checkpoint state and the same buffer window -- the only
+    difference across draft positions is the causal mask."
+
+    The pre-tree state is therefore not a tensor we load; it is
+
+        Spre = P_h * S0 + sum_{j<h} (P_h / P_j) * k_j u_j^T
+
+    with P_j the cumulative decay through buffer entry j. Every place the folded
+    kernel used Spre, this one uses the checkpoint term plus a replay term:
+
+        Q Spre^T = P_h * (Q S0^T) + [(Q K_buf^T) * w] U_buf
+        K Spre^T = P_h * (K S0^T) + [(K K_buf^T) * w] U_buf,   w_j = P_h / P_j
+
+    Both replay terms are [BT, L] @ [L, BV] with L <= 16, so they are small next to
+    the [BT, K] @ [K, BV] checkpoint product they supplement.
+    """
+    i_v, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    bos = i_b * T
+
+    q += (bos * Hg + i_h // (H // Hg)) * K
+    k += (bos * Hg + i_h // (H // Hg)) * K
+    v += (bos * H + i_h) * V
+    o += (bos * H + i_h) * V
+
+    h0_idx = tl.load(h0_indices + i_b).to(tl.int64)
+    h0_valid = (h0_idx >= 0).to(tl.float32)
+    slot = tl.maximum(h0_idx, 0)
+    h0 = h0_source + (slot * H + i_h) * V * K
+
+    o_t = tl.arange(0, BT)
+    o_l = tl.arange(0, L)
+    m_t = o_t < T
+
+    # Ring contents. `rp_pos` is the number of committed entries, so entries
+    # [0, rp_pos) are live and the rest are stale -- masking on the cursor is what
+    # makes a rollback "purely a pointer move" with no buffer rewrite.
+    n_valid = tl.load(rp_pos + i_b).to(tl.int32)
+    # The block extent L is padded to a tensor-core friendly width; validity is
+    # bounded by BOTH the live cursor and the real ring length.
+    m_l = (o_l < n_valid) & (o_l < L_true)
+
+    p_rg = rp_g + (slot * H + i_h) * L_true + o_l
+    b_rg = tl.load(p_rg, mask=m_l & (o_l < L_true), other=0.0).to(tl.float32)
+    # Suffix decay: P_h / P_j = exp(sum_{i>j} g_i). Computed as a masked scan so
+    # the whole window is one pass and no cumulative state crosses iterations.
+    g_tot = tl.sum(tl.where(m_l, b_rg, 0.0))
+    g_pre = tl.cumsum(tl.where(m_l, b_rg, 0.0), axis=0)
+    # NOT safe_exp here. safe_exp(x) = exp(where(x <= 0, x, -inf)) returns ZERO for
+    # any positive argument -- it exists to mask non-ancestor pairs. These decays
+    # are mathematically <= 0, but for the most recent entry g_tot - g_pre is
+    # exactly 0 in exact arithmetic and lands epsilon-POSITIVE after a float
+    # cumsum, so safe_exp silently dropped the newest buffer entry. With a 4-entry
+    # window that is a ~25% error in the replay term, which is what the identity
+    # test caught. Clamp instead of masking.
+    w_j = tl.where(m_l, exp(tl.minimum(g_tot - g_pre, 0.0)), 0.0)
+    p_h = exp(tl.minimum(g_tot, 0.0))                       # decay on the checkpoint
+
+    b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    b_qk = tl.zeros([BT, BT], dtype=tl.float32)
+    b_kk = tl.zeros([BT, BT], dtype=tl.float32)
+    b_kh0 = tl.zeros([BT, BV], dtype=tl.float32)
+    b_qkb = tl.zeros([BT, L], dtype=tl.float32)             # Q @ K_buf^T
+    b_kkb = tl.zeros([BT, L], dtype=tl.float32)             # K @ K_buf^T
+
+    for i_k in range(tl.cdiv(K, BK)):
+        p_q = tl.make_block_ptr(q, (T, K), (Hg * K, 1), (0, i_k * BK), (BT, BK), (1, 0))
+        p_kt = tl.make_block_ptr(k, (T, K), (Hg * K, 1), (0, i_k * BK), (BT, BK), (1, 0))
+        p_h0 = tl.make_block_ptr(
+            h0, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
+        )
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_kt = tl.load(p_kt, boundary_check=(0, 1))
+        b_h0 = (tl.load(p_h0, boundary_check=(0, 1)).to(tl.float32) * h0_valid).to(
+            b_q.dtype
+        )
+        b_o += tl.dot(b_q, tl.trans(b_h0))
+        b_qk += tl.dot(b_q, tl.trans(b_kt))
+        b_kk += tl.dot(b_kt, tl.trans(b_kt))
+        b_kh0 += tl.dot(b_kt, tl.trans(b_h0))
+
+        # Replay keys for this K slice. rp_k is [slot, H, L, K]; the head group
+        # index matches q/k, not the value head.
+        p_rk = tl.make_block_ptr(
+            rp_k + (slot * Hg + i_h // (H // Hg)) * L_true * K,
+            (L_true, K), (K, 1), (0, i_k * BK), (L, BK), (1, 0),
+        )
+        b_rk = tl.load(p_rk, boundary_check=(0, 1))
+        b_qkb += tl.dot(b_q, tl.trans(b_rk))
+        b_kkb += tl.dot(b_kt, tl.trans(b_rk))
+
+    # Replay values for this value tile: [L, BV].
+    p_rd = tl.make_block_ptr(
+        rp_d + (slot * H + i_h) * L_true * V,
+        (L_true, V), (V, 1), (0, i_v * BV), (L, BV), (1, 0),
+    )
+    b_rd = tl.load(p_rd, boundary_check=(0, 1))
+
+    # Spre products = decayed checkpoint + decay-weighted replay.
+    b_qkb = tl.where(m_l[None, :], b_qkb * w_j[None, :], 0.0)
+    b_kkb = tl.where(m_l[None, :], b_kkb * w_j[None, :], 0.0)
+    b_o = b_o * p_h + tl.dot(b_qkb.to(b_rd.dtype), b_rd)
+    b_kh0 = b_kh0 * p_h + tl.dot(b_kkb.to(b_rd.dtype), b_rd)
+
+    p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (0,), (BT,), (0,))
+    b_g = tl.load(p_g, boundary_check=(0,))
+    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (0,), (BT,), (0,))
+    b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+    b_anc = tl.load(ancestor_masks + i_b * BT + o_t, mask=m_t, other=0)
+
+    m_strict = ((b_anc[:, None] >> o_t[None, :].to(tl.int64)) & 1) != 0
+
+    p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (0, i_v * BV), (BT, BV), (1, 0))
+    b_v_raw = tl.load(p_v, boundary_check=(0, 1))
+    b_v = b_v_raw.to(tl.float32)
+
+    b_kk = b_kk * safe_exp(b_g[:, None] - b_g[None, :])
+    b_Gc = (tl.where(m_strict, b_kk, 0.0) * b_beta[:, None]).to(b_v_raw.dtype)
+
+    b_rhs = b_beta[:, None] * (b_v - exp(b_g)[:, None] * b_kh0)
+
+    b_z = b_rhs.to(b_v_raw.dtype)
+    for _ in tl.static_range(NEUMANN_TERMS):
+        b_z = (-tl.dot(b_Gc, b_z)).to(b_v_raw.dtype)
+        b_rhs += b_z
+    b_v_new = b_rhs.to(b_v_raw.dtype)
+
+    m_path = m_strict | (o_t[:, None] == o_t[None, :])
+    b_o = b_o * exp(b_g)[:, None]
+    b_qk = b_qk * safe_exp(b_g[:, None] - b_g[None, :])
+    b_qk = tl.where(m_path, b_qk, 0.0)
+    b_o = (b_o + tl.dot(b_qk.to(b_v_new.dtype), b_v_new)) * scale
+
+    p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (0, i_v * BV), (BT, BV), (1, 0))
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.jit(do_not_specialize=["T"])
 def tree_verify_o_fused_kernel(
     q,
     k,
@@ -1060,6 +1234,82 @@ def tree_verify_o_fused_kernel(
 
     p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (0, i_v * BV), (BT, BV), (1, 0))
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
+def chunk_gated_delta_rule_tree_verify_replay(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    ancestor_masks,
+    initial_state_source,
+    initial_state_indices,
+    replay_d,
+    replay_k,
+    replay_g,
+    replay_pos,
+    scale=None,
+    use_qk_l2norm_in_kernel=False,
+    max_tree_depth=None,
+    num_warps=4,
+    num_stages=1,
+    BV=None,
+):
+    """Tree verify against a ReplaySSM checkpoint + ring buffer.
+
+    Same output as `chunk_gated_delta_rule_tree_verify_neumann`, but the pre-tree
+    state is reconstructed from (checkpoint, buffer) rather than read as a folded
+    tensor. That is what lets the COMMIT append 2(d+n+1) bytes per step instead of
+    storing 8dn -- the actual saving ReplaySSM claims.
+
+    replay_d/k/g are the ring buffers already allocated by the decode path
+    (`[num_slots, HV, L, V]`, `[num_slots, H, L, K]`, `[num_slots, HV, L]`);
+    replay_pos is the per-request count of live entries.
+    """
+    B, T, Hg, K = k.shape
+    H, V = v.shape[-2], v.shape[-1]
+    BT = TREE_CHUNK_SIZE
+    assert T <= BT, f"chunk tree verify supports at most {BT} draft tokens, got {T}"
+    if ancestor_masks.dim() == 3:
+        assert ancestor_masks.shape[-1] == 1 and ancestor_masks.shape[-2] == BT
+        ancestor_masks = ancestor_masks[..., 0]
+    assert q.dtype != torch.float32, "use bfloat16/float16 inputs"
+    L = replay_g.shape[-1]
+
+    if scale is None:
+        scale = K**-0.5
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    g, beta = g.contiguous(), beta.contiguous()
+
+    g_path = torch.empty_like(g, dtype=torch.float32)
+    tree_path_cumsum_kernel[(B,)](
+        g=g, g_path=g_path, ancestor_masks=ancestor_masks, T=T, H=H, BT=BT,
+        BH=max(16, triton.next_power_of_2(H)),
+    )
+
+    terms = int(max_tree_depth) if max_tree_depth is not None else NEUMANN_DEFAULT_TERMS
+    terms = max(1, min(terms, int(T) - 1))
+    if BV is None:
+        BV = V if V <= 128 else 64
+
+    o = torch.empty_like(v)
+    grid = (triton.cdiv(V, BV), B * H)
+    tree_verify_o_replay_kernel[grid](
+        q=q, k=k, v=v, beta=beta, g=g_path, ancestor_masks=ancestor_masks,
+        h0_source=initial_state_source, h0_indices=initial_state_indices,
+        rp_d=replay_d, rp_k=replay_k, rp_g=replay_g, rp_pos=replay_pos,
+        o=o, scale=scale, T=T, L_true=L, H=H, Hg=Hg, K=K, V=V,
+        # Pad the buffer axis to 64: a tl.dot with N=16 is below the tensor-core
+        # tile and was measurably wrong on this target (20% error on the replay
+        # term while the checkpoint term was exact). Masking keeps it correct.
+        L=max(64, triton.next_power_of_2(L)), BT=BT, BK=64, BV=BV,
+        NEUMANN_TERMS=terms, num_warps=num_warps, num_stages=num_stages,
+    )
+    return o
 
 
 def chunk_gated_delta_rule_tree_verify_neumann(

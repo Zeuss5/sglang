@@ -2031,6 +2031,14 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
     # so instance counters reset every call and never reach a report threshold.
     _accept_hist = None
     _accept_steps = 0
+    _pool_hit = 0
+    _pool_tot = 0
+    _pool_nz = 0
+    _pool_cells = 0
+    _rank_sum = 0.0
+    _rank_n = 0
+    _rank_le = {8: 0, 16: 0, 64: 0}
+    _max_seen_depth = 1
     # 1024, not 4096: at c1 a step contributes ONE draft, so a 4096 threshold
     # needs more steps than a short benchmark runs and the histogram never prints.
     _accept_report_every = 1024
@@ -2165,7 +2173,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         )
 
 
-    def _dump_accept_stats(self, batch, accept_index, num_correct):
+    def _dump_accept_stats(self, batch, accept_index, num_correct, predict=None):
         """Where along the draft does acceptance stop?
 
         L2R weights the FIRST ERROR because that is what terminates a draft: every
@@ -2190,6 +2198,66 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                     d, minlength=self.draft_token_num + 1
                 )
                 DFlashTfmVerifyInput._accept_steps += d.numel()
+                DFlashTfmVerifyInput._max_seen_depth = max(
+                    DFlashTfmVerifyInput._max_seen_depth, int(d.max().item())
+                )
+
+                # THE adapter-vs-backbone question. Greedy verify tries EVERY
+                # sibling and accepts if any matches the target's argmax, so at a
+                # first error none of the proposed children was right -- re-ranking
+                # the TREE cannot fix it. What Weaver controls is which candidates
+                # are promoted from the drafter's POOL into the tree. So: was the
+                # target's token in the pool and merely not selected?
+                #
+                #   in pool  -> better scoring fixes it; retraining the 56.7M
+                #              adapter is enough (the plan's cheap path)
+                #   not in pool -> the drafter never proposed it; only a backbone
+                #              retrain can help (the expensive path)
+                if predict is not None and self.pool_ids is not None:
+                    bs_ = d.numel()
+                    rows = torch.arange(bs_, device=d.device)
+                    last_flat = accept_index[rows, d].to(torch.long)
+                    local = last_flat - rows * self.draft_token_num
+                    tgt = predict.view(-1)[last_flat]
+                    pool = self.pool_ids.view(bs_, self.draft_token_num, -1)[
+                        rows, local.clamp(min=0, max=self.draft_token_num - 1)
+                    ]
+                    hit = (pool == tgt[:, None]).any(dim=1)
+                    # Sanity: a hard zero hit-rate is far more likely to mean the
+                    # pool is empty than that the drafter never proposes the right
+                    # token. Track how much of the pool is even populated.
+                    DFlashTfmVerifyInput._pool_nz += int((pool != 0).sum().item())
+                    DFlashTfmVerifyInput._pool_cells += int(pool.numel())
+                    # Max REACHABLE depth is the tree's, not draft_token_num-1:
+                    # at budget 17 the tree is 9 deep, so comparing against 17
+                    # counts full-depth accepts as errors.
+                    errored = d < int(DFlashTfmVerifyInput._max_seen_depth)
+                    # Membership in a 512-wide pool is weak evidence on its own.
+                    # What a re-scorer can realistically fix is a token ranked just
+                    # outside the promoted set (expand_width), not one ranked 400
+                    # deep. pool_ids is emitted in the drafter's own score order,
+                    # so the column index IS the drafter's rank.
+                    idx = torch.arange(pool.shape[1], device=pool.device)
+                    match = pool == tgt[:, None]
+                    rank = torch.where(
+                        match, idx[None, :], torch.full_like(idx[None, :], 1 << 20)
+                    ).min(dim=1).values
+                    good = errored & hit
+                    if good.any():
+                        r = rank[good].to(torch.float32)
+                        DFlashTfmVerifyInput._rank_sum += float(r.sum().item())
+                        DFlashTfmVerifyInput._rank_n += int(good.sum().item())
+                        for k, thr in ((8, 8), (16, 16), (64, 64)):
+                            DFlashTfmVerifyInput._rank_le[thr] += int(
+                                (r < thr).sum().item()
+                            )
+                    # Only rows that actually errored: a full-depth accept has no
+                    # first error to attribute.
+
+                    DFlashTfmVerifyInput._pool_hit += int(
+                        (hit & errored).sum().item()
+                    )
+                    DFlashTfmVerifyInput._pool_tot += int(errored.sum().item())
                 if DFlashTfmVerifyInput._accept_steps >= DFlashTfmVerifyInput._accept_report_every:
                     h = DFlashTfmVerifyInput._accept_hist.tolist()
                     tot = max(sum(h), 1)
@@ -2199,11 +2267,35 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                             continue
                         cum += n
                         lines.append(f"{i}:{n / tot:.3f}({cum / tot:.3f})")
+                    pt = DFlashTfmVerifyInput._pool_tot
+                    ph = DFlashTfmVerifyInput._pool_hit
+                    pool_line = (
+                        f" | target-in-pool at first error {ph}/{pt}"
+                        f" = {ph / pt:.3f}"
+                        f" | pool populated {DFlashTfmVerifyInput._pool_nz}/"
+                        f"{DFlashTfmVerifyInput._pool_cells}"
+                        f" = {DFlashTfmVerifyInput._pool_nz / max(DFlashTfmVerifyInput._pool_cells, 1):.3f}"
+                        f" | maxdepth {DFlashTfmVerifyInput._max_seen_depth}"
+                        f" | tgt rank in pool: mean "
+                        f"{DFlashTfmVerifyInput._rank_sum / max(DFlashTfmVerifyInput._rank_n, 1):.1f}"
+                        f" <8:{DFlashTfmVerifyInput._rank_le[8] / max(DFlashTfmVerifyInput._rank_n, 1):.3f}"
+                        f" <16:{DFlashTfmVerifyInput._rank_le[16] / max(DFlashTfmVerifyInput._rank_n, 1):.3f}"
+                        f" <64:{DFlashTfmVerifyInput._rank_le[64] / max(DFlashTfmVerifyInput._rank_n, 1):.3f}"
+                        if pt else ""
+                    )
+                    DFlashTfmVerifyInput._pool_hit = 0
+                    DFlashTfmVerifyInput._pool_tot = 0
+                    DFlashTfmVerifyInput._pool_nz = 0
+                    DFlashTfmVerifyInput._pool_cells = 0
+                    DFlashTfmVerifyInput._rank_sum = 0.0
+                    DFlashTfmVerifyInput._rank_n = 0
+                    DFlashTfmVerifyInput._rank_le = {8: 0, 16: 0, 64: 0}
                     logger.warning(
                         "DFLASH_TFM first-error depth over %d drafts "
-                        "[depth:frac(cumulative)]: %s | mean accepted %.3f",
+                        "[depth:frac(cumulative)]: %s | mean accepted %.3f%s",
                         tot, " ".join(lines),
                         sum(i * n for i, n in enumerate(h)) / tot,
+                        pool_line,
                     )
                     DFlashTfmVerifyInput._accept_hist = None
                     DFlashTfmVerifyInput._accept_steps = 0
@@ -2445,7 +2537,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         # is the prefix before it, not every non-negative entry. `argmax` on the
         # boolean gives that first index; rows with no -1 take the full width.
         if envs.SGLANG_DFLASH_TFM_DUMP_ACCEPT.get():
-            self._dump_accept_stats(batch, accept_index, num_correct)
+            self._dump_accept_stats(batch, accept_index, num_correct, predict)
         _loop_verify = envs.SGLANG_DFLASH_TFM_LOOP_VERIFY.get()
         if not DFlashTfmWorker._accept_path_logged:
             DFlashTfmWorker._accept_path_logged = True

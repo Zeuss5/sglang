@@ -1651,6 +1651,210 @@ def tree_verify_state_advance_kernel(
     tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
 
 
+@triton.jit
+def tree_verify_state_append_kernel(
+    k_stash,
+    v_stash,
+    g_stash,
+    beta_stash,
+    ssm_states,          # checkpoint S0, written ONLY on flush
+    rp_d,                # [num_slots, HV, L, V] ring: corrections u
+    rp_k,                # [num_slots, H,  L, K] ring: keys
+    rp_g,                # [num_slots, HV, L]    ring: log decays (fp32)
+    rp_pos,              # [B] int32 live-entry count, updated device-side
+    cache_indices,
+    ancestor_masks,
+    last_correct_steps,
+    T,
+    L_ring,
+    stride_kl,
+    stride_vl,
+    stride_gl,
+    stride_bl,
+    stride_sl,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    NW: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    SPEC_WINDOW: tl.constexpr,
+):
+    """Commit the accepted path by APPENDING inputs, not storing state.
+
+    ReplaySSM's saving is the store: the baseline writes the full [K, V] state
+    every step (8dn bytes), this appends (u, k, g) per accepted node
+    (~2(d+n+1) bytes) and only materialises a checkpoint on flush.
+
+    Flush policy follows the paper's speculative rule rather than the standard one.
+    Standard decoding flushes when `h + 1 > L`. Under speculation the post flushes
+    ONE WINDOW EARLY, `h + 2T > L`, which "guarantees >= T free slots per step and
+    prevents window truncation on acceptance" -- without it a step that accepts a
+    full window would need to split its append across a flush boundary.
+
+    GDN cannot cache raw v (the post's gotcha 3): u_t = beta_t (v_t - S_{t-1} k_t)
+    needs the running state, so the state IS materialised in registers here. That
+    is inherent to the delta rule and is why only the store, not the load, is
+    saved.
+
+    rp_pos is updated on device. Sending accepted counts to the host would add a
+    sync every step, which the post calls out explicitly as something to avoid.
+    """
+    i_l, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    i_n, i_hv = i_nh // H, i_nh % H
+    i_h = i_hv // (H // Hg)
+
+    slot = tl.load(cache_indices + i_n).to(tl.int64)
+    leaf = tl.load(last_correct_steps + i_n).to(tl.int64)
+
+    o_w = tl.arange(0, NW)
+    b_anc = tl.load(ancestor_masks + (i_n * BT + leaf) * NW + o_w)
+    path_words = b_anc | tl.where(
+        o_w == (leaf // 64), tl.full((), 1, tl.int64) << (leaf % 64), 0
+    )
+
+    o_k = tl.arange(0, BK)
+    o_v = i_v * BV + tl.arange(0, BV)
+    mask_k = o_k < K
+    mask_v = o_v < V
+    mask_h = mask_k[:, None] & mask_v[None, :]
+
+    p_h = (
+        ssm_states + i_l * stride_sl + slot * H * K * V + i_hv * K * V
+        + o_v[None, :] * K + o_k[:, None]
+    )
+    b_h = tl.load(p_h, mask=mask_h, other=0).to(tl.float32)
+
+    # Replay the live window onto the checkpoint to recover the current state.
+    h_live = tl.load(rp_pos + i_n).to(tl.int32)
+    for j in range(0, h_live):
+        rg = tl.load(rp_g + (slot * H + i_hv) * L_ring + j).to(tl.float32)
+        rk = tl.load(rp_k + ((slot * Hg + i_h) * L_ring + j) * K + o_k,
+                     mask=mask_k, other=0).to(tl.float32)
+        rd = tl.load(rp_d + ((slot * H + i_hv) * L_ring + j) * V + o_v,
+                     mask=mask_v, other=0).to(tl.float32)
+        b_h = b_h * tl.exp(rg) + rk[:, None] * rd[None, :]
+
+    p_k = k_stash + i_l * stride_kl + i_n * T * Hg * K + i_h * K + o_k
+    p_v = v_stash + i_l * stride_vl + i_n * T * H * V + i_hv * V + o_v
+    p_g = g_stash + i_l * stride_gl + i_n * T * H + i_hv
+    p_b = beta_stash + i_l * stride_bl + i_n * T * H + i_hv
+
+    # Count what this step will append, so the flush decision is made before any
+    # write and the window is never split.
+    n_acc = 0
+    for t in range(0, T):
+        word = tl.sum(tl.where(o_w == (t // 64), path_words, 0))
+        if ((word >> (t % 64)) & 1) != 0:
+            n_acc += 1
+
+    will_flush = (h_live + n_acc + SPEC_WINDOW) > L_ring
+
+    w = h_live
+    for t in range(0, T):
+        word = tl.sum(tl.where(o_w == (t // 64), path_words, 0))
+        on_path = ((word >> (t % 64)) & 1) != 0
+        if on_path:
+            b_k = tl.load(p_k + t * Hg * K, mask=mask_k, other=0).to(tl.float32)
+            b_v = tl.load(p_v + t * H * V, mask=mask_v, other=0).to(tl.float32)
+            b_g = tl.load(p_g + t * H).to(tl.float32)
+            b_beta = tl.load(p_b + t * H).to(tl.float32)
+
+            b_h *= tl.exp(b_g)
+            b_v -= tl.sum(b_h * b_k[:, None], 0)
+            b_v *= b_beta
+            b_h += b_k[:, None] * b_v[None, :]
+
+            if not will_flush:
+                # Append. Only the value-tile owner writes k and g, which are not
+                # tiled over V, so they are not written once per tile.
+                tl.store(rp_d + ((slot * H + i_hv) * L_ring + w) * V + o_v,
+                         b_v.to(rp_d.dtype.element_ty), mask=mask_v)
+                if i_v == 0:
+                    tl.store(rp_k + ((slot * Hg + i_h) * L_ring + w) * K + o_k,
+                             b_k.to(rp_k.dtype.element_ty), mask=mask_k)
+                    tl.store(rp_g + (slot * H + i_hv) * L_ring + w, b_g)
+                w += 1
+
+    if will_flush:
+        # Fold everything into the checkpoint and empty the ring.
+        tl.store(p_h, b_h.to(p_h.dtype.element_ty), mask=mask_h)
+        if i_v == 0 and i_hv == 0 and i_l == 0:
+            tl.store(rp_pos + i_n, 0)
+    else:
+        if i_v == 0 and i_hv == 0 and i_l == 0:
+            tl.store(rp_pos + i_n, w)
+
+
+def append_ssm_inputs_along_accept_paths(
+    k_stash: torch.Tensor,
+    v_stash: torch.Tensor,
+    g_stash: torch.Tensor,
+    beta_stash: torch.Tensor,
+    ssm_states: torch.Tensor,
+    replay_d: torch.Tensor,
+    replay_k: torch.Tensor,
+    replay_g: torch.Tensor,
+    replay_pos: torch.Tensor,
+    cache_indices: torch.Tensor,
+    ancestor_masks: torch.Tensor,
+    last_correct_steps: torch.Tensor,
+    T: int,
+    Hg: int,
+    K: int,
+    V: int,
+    spec_window: int,
+):
+    """ReplaySSM commit: append accepted inputs to the ring, flush when needed.
+
+    Drop-in for `advance_ssm_states_along_accept_paths`. `spec_window` is the
+    paper's T in the `h + 2T > L` rule -- pass the draft token count so a step that
+    accepts a whole window still has room.
+    """
+    L = ssm_states.shape[0]
+    H = ssm_states.shape[2]
+    B = cache_indices.shape[0]
+    assert ancestor_masks.dim() == 3, "ancestor_masks must be [B, BT, BT // 64]"
+    BT, NW = ancestor_masks.shape[-2], ancestor_masks.shape[-1]
+    assert NW == BT // 64 and T <= BT, (BT, NW, T)
+    L_ring = replay_g.shape[-1]
+    BK = triton.next_power_of_2(K)
+    BV = min(triton.next_power_of_2(V), 32)
+    grid = (L, triton.cdiv(V, BV), B * H)
+    tree_verify_state_append_kernel[grid](
+        k_stash=k_stash,
+        v_stash=v_stash,
+        g_stash=g_stash,
+        beta_stash=beta_stash,
+        ssm_states=ssm_states,
+        rp_d=replay_d,
+        rp_k=replay_k,
+        rp_g=replay_g,
+        rp_pos=replay_pos,
+        cache_indices=cache_indices,
+        ancestor_masks=ancestor_masks,
+        last_correct_steps=last_correct_steps,
+        T=T,
+        L_ring=L_ring,
+        stride_kl=k_stash.stride(0),
+        stride_vl=v_stash.stride(0),
+        stride_gl=g_stash.stride(0),
+        stride_bl=beta_stash.stride(0),
+        stride_sl=ssm_states.stride(0),
+        H=H,
+        Hg=Hg,
+        K=K,
+        V=V,
+        BT=BT,
+        NW=NW,
+        BK=BK,
+        BV=BV,
+        SPEC_WINDOW=int(spec_window),
+    )
+
+
 def advance_ssm_states_along_accept_paths(
     k_stash: torch.Tensor,
     v_stash: torch.Tensor,

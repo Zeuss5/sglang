@@ -41,6 +41,7 @@ if is_tf32_supported:
 else:
     _MERGE_DOT_PRECISION = tl.constexpr("ieee")
 
+NEUMANN_DEFAULT_TERMS = 4
 TREE_CHUNK_SIZE = 64
 
 
@@ -803,6 +804,151 @@ def tree_verify_o_kernel(
 
 
 @triton.jit(do_not_specialize=["T"])
+def tree_verify_o_neumann_kernel(
+    q,
+    k,
+    v,
+    beta,
+    g,
+    ancestor_masks,
+    h0_source,
+    h0_indices,
+    o,
+    scale,
+    T,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BT: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    NEUMANN_TERMS: tl.constexpr,
+):
+    """Bole's parallel tree recurrence: no explicit inverse, no A_inv round trip.
+
+    arXiv 2608.01651 Theorem 1 writes the whole tree verify in closed form
+
+        O = DP Q Spre + C (I+G)^-1 Dbeta (V - DP K Spre)
+        G = Dbeta DP [(K K^T) . M-] DP^-1        (M- = STRICT ancestors)
+        C = DP [(Q K^T) . M+] DP^-1              (M+ = ancestors + self)
+
+    G is nonzero only on ancestor pairs, so it is nilpotent in the tree depth:
+    G^(d+1) = 0. Their Lemma 3 therefore replaces the inverse with a FINITE
+    Neumann series that is exact, not approximate:
+
+        (I+G)^-1 = sum_{m=0..d} (-G)^m
+
+    evaluated as the recurrence Z(0) = R, Z(m+1) = -G Z(m), U = sum_m Z(m).
+
+    Why this is faster than what we had:
+      * `tree_kkt_solve_kernel` inverts by FORWARD SUBSTITUTION -- a serial
+        row-at-a-time loop that never reaches a tensor core -- and then writes a
+        [T, T] A_inv per (batch, head) to HBM for the output kernel to read back.
+      * Each -G Z(m) here is a dense MMA, so the solve becomes d+1 tensor-core
+        ops and G, Z and the output tile never leave the CTA. The paper reports
+        occupancy up 3.6-7.9x, state materialisation being 38%/86% of serial
+        verify time on A100/GB10, and 3.4-7.5x per-layer GDN latency (Table VII).
+
+    NEUMANN_TERMS is the tree's maximum depth: a property of the drafter's block
+    size, not of the data, so it stays a compile-time constant and the loop
+    unrolls. MORE terms than the depth is harmless -- the extra powers of G are
+    exactly zero -- FEWER is wrong, so the caller passes the bound.
+    """
+    i_v, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_h = i_bh // H, i_bh % H
+    bos = i_b * T
+
+    q += (bos * Hg + i_h // (H // Hg)) * K
+    k += (bos * Hg + i_h // (H // Hg)) * K
+    v += (bos * H + i_h) * V
+    o += (bos * H + i_h) * V
+
+    h0_idx = tl.load(h0_indices + i_b).to(tl.int64)
+    h0_valid = (h0_idx >= 0).to(tl.float32)
+    h0 = h0_source + (tl.maximum(h0_idx, 0) * H + i_h) * V * K
+
+    o_t = tl.arange(0, BT)
+    m_t = o_t < T
+
+    b_o = tl.zeros([BT, BV], dtype=tl.float32)
+    b_qk = tl.zeros([BT, BT], dtype=tl.float32)
+    b_kk = tl.zeros([BT, BT], dtype=tl.float32)
+    b_kh0 = tl.zeros([BT, BV], dtype=tl.float32)
+
+    # One pass over K builds every second-order term the closed form needs:
+    # Q h0^T (the Spre readout), Q K^T (C), K K^T (G) and K h0^T (the residual).
+    for i_k in range(tl.cdiv(K, BK)):
+        p_q = tl.make_block_ptr(q, (T, K), (Hg * K, 1), (0, i_k * BK), (BT, BK), (1, 0))
+        p_kt = tl.make_block_ptr(k, (T, K), (Hg * K, 1), (0, i_k * BK), (BT, BK), (1, 0))
+        p_h0 = tl.make_block_ptr(
+            h0, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
+        )
+        b_q = tl.load(p_q, boundary_check=(0, 1))
+        b_kt = tl.load(p_kt, boundary_check=(0, 1))
+        b_h0 = (tl.load(p_h0, boundary_check=(0, 1)).to(tl.float32) * h0_valid).to(
+            b_q.dtype
+        )
+        b_o += tl.dot(b_q, tl.trans(b_h0))
+        b_qk += tl.dot(b_q, tl.trans(b_kt))
+        b_kk += tl.dot(b_kt, tl.trans(b_kt))
+        b_kh0 += tl.dot(b_kt, tl.trans(b_h0))
+
+    p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (0,), (BT,), (0,))
+    b_g = tl.load(p_g, boundary_check=(0,))
+    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T,), (H,), (0,), (BT,), (0,))
+    b_beta = tl.load(p_beta, boundary_check=(0,)).to(tl.float32)
+    b_anc = tl.load(ancestor_masks + i_b * BT + o_t, mask=m_t, other=0)
+
+    # M- : j is a STRICT ancestor of i. M+ additionally admits the diagonal.
+    m_strict = ((b_anc[:, None] >> o_t[None, :].to(tl.int64)) & 1) != 0
+
+    # G = Dbeta DP [(K K^T) . M-] DP^-1 -- exactly the matrix that
+    # tree_kkt_solve_kernel builds as A before inverting it.
+    #
+    # REGISTER PRESSURE: build G in place over b_kk and narrow it to the matmul
+    # dtype immediately. Keeping b_kk, a separate fp32 b_G, b_qk, b_o, b_kh0, b_z
+    # and b_u all live is seven [BT,BT]/[BT,BV] fp32 tiles -- about 110KB per CTA,
+    # which spills at any sane warp count and made a first version slower than the
+    # two-kernel reference it replaces.
+    # Load v FIRST and keep its native dtype: the Neumann matmuls must run at the
+    # reference's bf16 precision. An earlier version cast G and Z to b_v.dtype
+    # AFTER b_v had already been promoted to fp32, so every tl.dot in the series
+    # ran in fp32 -- off the tensor cores, in the innermost loop of the kernel.
+    # That single line, not the algorithm, is what made the series look slow.
+    p_v = tl.make_block_ptr(v, (T, V), (H * V, 1), (0, i_v * BV), (BT, BV), (1, 0))
+    b_v_raw = tl.load(p_v, boundary_check=(0, 1))
+    b_v = b_v_raw.to(tl.float32)
+
+    b_kk = b_kk * safe_exp(b_g[:, None] - b_g[None, :])
+    b_Gc = (tl.where(m_strict, b_kk, 0.0) * b_beta[:, None]).to(b_v_raw.dtype)
+
+    # R = Dbeta (V - DP K Spre)
+    b_rhs = b_beta[:, None] * (b_v - exp(b_g)[:, None] * b_kh0)
+
+    # Finite Neumann, entirely on chip, accumulating in place. Kept at the
+    # reference's matmul precision: the unfused path materialises u in bf16 and
+    # does the final product in bf16, so an fp32 tl.dot here would be both slower
+    # and numerically different from the kernel this is gated against.
+    b_z = b_rhs.to(b_v_raw.dtype)
+    for _ in tl.static_range(NEUMANN_TERMS):
+        b_z = (-tl.dot(b_Gc, b_z)).to(b_v_raw.dtype)
+        b_rhs += b_z
+    b_v_new = b_rhs.to(b_v_raw.dtype)
+
+    m_path = m_strict | (o_t[:, None] == o_t[None, :])
+
+    b_o = b_o * exp(b_g)[:, None]
+    b_qk = b_qk * safe_exp(b_g[:, None] - b_g[None, :])
+    b_qk = tl.where(m_path, b_qk, 0.0)
+
+    b_o = (b_o + tl.dot(b_qk.to(b_v_new.dtype), b_v_new)) * scale
+
+    p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (0, i_v * BV), (BT, BV), (1, 0))
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
+@triton.jit(do_not_specialize=["T"])
 def tree_verify_o_fused_kernel(
     q,
     k,
@@ -914,6 +1060,124 @@ def tree_verify_o_fused_kernel(
 
     p_o = tl.make_block_ptr(o, (T, V), (H * V, 1), (0, i_v * BV), (BT, BV), (1, 0))
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+
+def chunk_gated_delta_rule_tree_verify_neumann(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    ancestor_masks,
+    initial_state_source,
+    initial_state_indices,
+    scale=None,
+    use_qk_l2norm_in_kernel=False,
+    max_tree_depth=None,
+    num_warps=4,
+    num_stages=1,
+    BV=None,
+):
+    """Bole's two-stage tree verify (arXiv 2608.01651).
+
+    Drops BOTH middle stages of the existing pipeline:
+
+        cumsum -> [kkt solve -> recompute_w_u] -> output      (before)
+        cumsum -> output                                      (here)
+
+    The KKT solve inverted (I+G) by serial forward substitution and staged a
+    [B, T, H, BT] A_inv through HBM purely so the output kernel could read it
+    back. G is nilpotent in the tree depth, so the inverse is a finite Neumann
+    series the output CTA can evaluate itself with tensor-core MMAs.
+
+    `max_tree_depth` bounds the series. It is a config property (the drafter's
+    block size), not data, so it stays constexpr. Defaults to T-1, which is
+    always correct -- a chain -- but costs terms that are identically zero.
+    """
+    B, T, Hg, K = k.shape
+    H, V = v.shape[-2], v.shape[-1]
+    # BT is the fixed chunk extent, NOT next_power_of_2(T). The kernels index
+    # ancestor_masks with a stride of BT per batch, so deriving BT from T silently
+    # reads the wrong rows for any T that is not already TREE_CHUNK_SIZE -- which
+    # is why an earlier version passed at T=64 and failed at T=18 and T=32.
+    BT = TREE_CHUNK_SIZE
+    assert T <= BT, f"chunk tree verify supports at most {BT} draft tokens, got {T}"
+    if ancestor_masks.dim() == 3:
+        assert ancestor_masks.shape[-1] == 1 and ancestor_masks.shape[-2] == BT
+        ancestor_masks = ancestor_masks[..., 0]
+    assert q.dtype != torch.float32, "use bfloat16/float16 inputs"
+
+    if scale is None:
+        scale = K**-0.5
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    g = g.contiguous()
+    beta = beta.contiguous()
+
+    g_path = torch.empty_like(g, dtype=torch.float32)
+    tree_path_cumsum_kernel[(B,)](
+        g=g,
+        g_path=g_path,
+        ancestor_masks=ancestor_masks,
+        T=T,
+        H=H,
+        BT=BT,
+        BH=max(16, triton.next_power_of_2(H)),
+    )
+
+    # Term count. Bole specifies d+1 for exactness, but the series converges far
+    # sooner here and the extra terms are pure cost: measured on production-shaped
+    # inputs (q/k l2-normed, so max|G| ~ 0.13) the error hits the bf16 floor of
+    # 2.6e-3 at TWO terms and does not improve through 15. NEUMANN_DEFAULT_TERMS
+    # keeps a 2x margin over that saturation point and is still the fastest verify
+    # path measured; raise it toward the depth if a drafter ever produces trees
+    # with |G| near its 1.0 bound.
+    terms = int(max_tree_depth) if max_tree_depth is not None else NEUMANN_DEFAULT_TERMS
+    terms = max(1, min(terms, int(T) - 1))
+    # G is value-tile independent, so a single tile builds it once per (batch,head)
+    # instead of once per tile -- worth 1.55x over base against 1.13x at BV=64.
+    if BV is None:
+        BV = V if V <= 128 else 64
+
+    o = torch.empty_like(v)
+    # G does NOT depend on the value tile, but this kernel builds it itself rather
+    # than loading a precomputed A_inv -- so every extra value tile rebuilds it.
+    # With V=128, BV=64 costs two constructions per (batch, head) where the
+    # reference's KKT kernel pays one. BV=V removes that redundancy at the cost of
+    # wider live tiles.
+    grid = (triton.cdiv(V, BV), B * H)
+    tree_verify_o_neumann_kernel[grid](
+        q=q,
+        k=k,
+        v=v,
+        beta=beta,
+        g=g_path,
+        ancestor_masks=ancestor_masks,
+        h0_source=initial_state_source,
+        h0_indices=initial_state_indices,
+        o=o,
+        scale=scale,
+        T=T,
+        H=H,
+        Hg=Hg,
+        K=K,
+        V=V,
+        BT=BT,
+        BK=64,
+        BV=BV,
+        NEUMANN_TERMS=terms,
+        # Exposed for profiling: this kernel carries more live tile state than the
+        # reference output kernel (it builds G itself instead of loading A_inv), so
+        # the reference's num_warps=4 is not automatically the right choice here.
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return o
 
 
 def chunk_gated_delta_rule_tree_verify_fused(

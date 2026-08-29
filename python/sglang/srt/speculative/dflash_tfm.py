@@ -2076,6 +2076,12 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         # Tree-local slot of each request's last accepted node; populated by
         # verify() and consumed by the post-verify Mamba/GDN state commit.
         self.accept_leaf_slots: Optional[torch.Tensor] = None
+        # Lossless audit accumulators (SGLANG_DFLASH_TFM_LOSSLESS_AUDIT).
+        self._audit_exp = 0.0
+        self._audit_obs = 0.0
+        self._audit_n = 0
+        self._audit_every = envs.SGLANG_DFLASH_TFM_LOSSLESS_AUDIT_EVERY.get()
+
 
     def prepare_for_verify(
         self,
@@ -2270,7 +2276,68 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             pool_ms=self.pool_ms,
             univer_ok=self.univer_ok,
         )
+        if envs.SGLANG_DFLASH_TFM_LOSSLESS_AUDIT.get():
+            self._audit_losslessness(target_probs, candidates, num_correct)
         return predict, accept_index, num_correct
+
+    def _audit_losslessness(self, target_probs, candidates, num_correct):
+        """Empirical check of the one identity losslessness forces at the root.
+
+        For a candidate set C fixed given the drafter's output, ANY lossless rule
+        emits a token distributed exactly as the target, so acceptance at the root
+        (where the path probability p_tilde is 1) satisfies
+
+            P(accept at least one token)  =  sum_{c in C} p_target(c)
+
+        This is an identity, not a bound -- see Hu et al. (arXiv 2502.18779) Eq. 8,
+        SpecTr Lemma 3, UniVer Theorem 5, Not-a-Bandit Theorem 2. So the observed
+        root accept rate must converge to the mean of that sum, and ANY persistent
+        positive gap is a proof of leakage: the verifier is emitting the drafter's
+        preferred token more often than the target distribution allows.
+
+        This is the check that would have caught the original T>0 defect on day one
+        (top-K children scored by the cascade over-accepted, measured TV 0.55-0.73).
+        Off by default; costs two reductions per step when on.
+        """
+        try:
+            with torch.no_grad():
+                bs = target_probs.shape[0]
+                # Root children are the depth-1 nodes: parent index 0, excluding
+                # the root itself.
+                parents = self.parent_indices.view(bs, -1)
+                idx = torch.arange(parents.shape[1], device=parents.device)
+                is_root_child = (parents == 0) & (idx.unsqueeze(0) != 0)
+                if self.node_mask is not None:
+                    is_root_child &= self.node_mask.view(bs, -1).bool()
+                cand = candidates.view(bs, -1).to(torch.int64)
+                # p_target at the ROOT position, gathered at each child's token.
+                root_probs = target_probs[:, 0, :]
+                child_p = torch.gather(root_probs, 1, cand) * is_root_child
+                # Duplicate tokens among siblings would double-count the identity.
+                expected = child_p.sum(dim=1).clamp(max=1.0)
+                observed = (num_correct.view(bs) >= 1).to(expected.dtype)
+                self._audit_exp += float(expected.sum())
+                self._audit_obs += float(observed.sum())
+                self._audit_n += bs
+                if self._audit_n >= self._audit_every:
+                    e = self._audit_exp / self._audit_n
+                    o = self._audit_obs / self._audit_n
+                    gap = o - e
+                    # Binomial standard error on the observed rate.
+                    se = max((e * (1.0 - e) / self._audit_n) ** 0.5, 1e-9)
+                    z = gap / se
+                    verdict = "OK" if abs(z) < 4.0 else "LEAK"
+                    logger.warning(
+                        "DFLASH_TFM lossless audit [%s]: root accept observed "
+                        "%.4f vs required %.4f (gap %+.4f, %.1f sigma, n=%d). "
+                        "A persistent positive gap means the verifier accepts more "
+                        "than the target distribution permits.",
+                        verdict, o, e, gap, z, self._audit_n,
+                    )
+                    self._audit_exp = self._audit_obs = 0.0
+                    self._audit_n = 0
+        except Exception as exc:  # never let an audit break serving
+            logger.warning("DFLASH_TFM lossless audit skipped: %s", exc)
 
     def verify(
         self,
@@ -3331,8 +3398,15 @@ class DFlashTfmWorker(DFlashWorkerV2):
         # Sample a few trees from REAL traffic. Reporting only the first tree
         # measured a server-warmup tree built on synthetic tokens, which is
         # identical across configurations and told us nothing about the beam.
+        # The block below calls .item(), which cannot run inside a CUDA graph
+        # capture and would desync a replay. It is now opt-in and additionally
+        # refuses to run while capturing, so the default path is capturable.
         DFlashTfmWorker._dartree_calls += 1
-        if DFlashTfmWorker._dartree_calls in (200, 800, 2000):
+        if (
+            envs.SGLANG_DFLASH_TFM_DARTREE_STATS.get()
+            and not torch.cuda.is_current_stream_capturing()
+            and DFlashTfmWorker._dartree_calls in (200, 800, 2000)
+        ):
             # Structural report, once. A DARTree tree that silently shrinks looks
             # exactly like a DARTree tree that does not help.
             with torch.no_grad():
@@ -4150,8 +4224,20 @@ class DFlashTfmWorker(DFlashWorkerV2):
         candidate_scores_buffer.copy_(candidate_scores)
         proposal_features_buffer.copy_(proposal_features)
 
+        # Capture whichever builder is active. DARTree's shapes are static --
+        # width = beam and n_new = width * expand_width are Python ints, and
+        # `written` accumulates as an int -- so it captures on the same terms as
+        # the stock builder. Running it eager while stock was captured is what made
+        # the earlier comparison unfair: tree construction is ~15 sequential Weaver
+        # calls plus many small ops per level, exactly where launch overhead
+        # dominates, so the eager arm paid a cost the paper's design exists to avoid.
+        builder = (
+            self._build_tree_dartree_impl
+            if envs.SGLANG_DFLASH_TFM_DARTREE.get()
+            else self._build_tree_impl
+        )
         with torch.inference_mode():
-            self._build_tree_impl(
+            builder(
                 root_ids=root_ids_buffer,
                 output_norm=output_norm_buffer,
                 candidate_ids=candidate_ids_buffer,
@@ -4164,7 +4250,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             torch.cuda.synchronize(device)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
-                tree = self._build_tree_impl(
+                tree = builder(
                     root_ids=root_ids_buffer,
                     output_norm=output_norm_buffer,
                     candidate_ids=candidate_ids_buffer,
@@ -4209,6 +4295,11 @@ class DFlashTfmWorker(DFlashWorkerV2):
             bool(greedy),
             int(self.tree_budget),
             int(weaver_tree_batch_expand_width(self.tree_budget)),
+            # The builder and its shape-determining knobs: a graph captured for one
+            # must never be replayed for the other.
+            bool(envs.SGLANG_DFLASH_TFM_DARTREE.get()),
+            int(envs.SGLANG_DFLASH_TFM_DARTREE_BEAM.get()),
+            int(weaver_tree_expand_width()),
             root_ids.device.index,
             tuple(root_ids.shape),
             root_ids.dtype,
@@ -4266,24 +4357,8 @@ class DFlashTfmWorker(DFlashWorkerV2):
         token_embed: torch.Tensor,
         greedy: bool = False,
     ) -> WeaverTree:
-        if envs.SGLANG_DFLASH_TFM_DARTREE.get():
-            # Not graph-captured yet: DARTree's shapes are static, but the path
-            # needs to be correct before it is baked into a graph.
-            return self._build_tree_dartree_impl(
-                root_ids=root_ids,
-                output_norm=output_norm,
-                candidate_ids=candidate_ids,
-                candidate_weights=candidate_weights,
-                candidate_scores=candidate_scores,
-                proposal_features=proposal_features,
-                token_embed=token_embed,
-                greedy=greedy,
-            )
-        # DARTree currently runs eager, so a graph-captured stock path would be
-        # compared against it unfairly: tree construction is ~15 sequential Weaver
-        # calls plus many small ops per level, which is precisely where launch
-        # overhead dominates. This knob runs stock eager for an apples-to-apples
-        # cost comparison until DARTree is itself captured.
+        # Both builders now go through the same capture path, so the comparison is
+        # finally like-for-like. SGLANG_DFLASH_TFM_NO_TREE_GRAPH forces both eager.
         if root_ids.device.type == "cuda" and not envs.SGLANG_DFLASH_TFM_NO_TREE_GRAPH.get():
             return self._build_tree_with_cuda_graph(
                 root_ids=root_ids,
@@ -4295,7 +4370,12 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 token_embed=token_embed,
                 greedy=greedy,
             )
-        return self._build_tree_impl(
+        eager_builder = (
+            self._build_tree_dartree_impl
+            if envs.SGLANG_DFLASH_TFM_DARTREE.get()
+            else self._build_tree_impl
+        )
+        return eager_builder(
             root_ids=root_ids,
             output_norm=output_norm,
             candidate_ids=candidate_ids,

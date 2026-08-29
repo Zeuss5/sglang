@@ -703,11 +703,31 @@ class Envs:
     SGLANG_DFLASH_TFM_PURE_TOPK = EnvBool(False)
     SGLANG_DFLASH_TFM_DARTREE = EnvBool(False)
     SGLANG_DFLASH_TFM_DCUT_PROBE = EnvBool(False)
+    # Empirical losslessness audit: compares the observed root accept rate against
+    # the value losslessness forces, sum_{c in C} p_target(c). Any persistent
+    # positive gap is a proof of leakage. Off by default.
+    SGLANG_DFLASH_TFM_LOSSLESS_AUDIT = EnvBool(False)
+    SGLANG_DFLASH_TFM_LOSSLESS_AUDIT_EVERY = EnvInt(2000)
     SGLANG_DFLASH_TFM_EXPAND_WIDTH = EnvInt(8)
     SGLANG_DFLASH_TFM_TARGET_ROWS = EnvInt(0)
     SGLANG_DFLASH_TFM_BUDGET_SCHEDULE = EnvStr("")
     SGLANG_GDN_TREE_VERIFY_FUSED_WU = EnvBool(False)
-    SGLANG_DFLASH_TFM_DARTREE_BEAM = EnvInt(8)
+    # Bole (arXiv 2608.01651) parallel tree recurrence: replaces the serial
+    # forward-substitution inverse and its A_inv HBM round trip with an on-chip
+    # finite Neumann series. Exact, not approximate -- G is nilpotent in the tree
+    # depth. Off until its equivalence gate has run on GPU.
+    SGLANG_GDN_TREE_VERIFY_NEUMANN = EnvBool(False)
+    # 0 = use the kernel's profiled default (4). Set to the tree depth for Bole's
+    # exact d+1 series; measured, that is slower and no more accurate here.
+    SGLANG_GDN_TREE_VERIFY_NEUMANN_TERMS = EnvInt(0)
+    # DARTree (arXiv 2608.13524) supertree width W. The paper's default is 12;
+    # its Fig. 6(a) shows W is the knob that matters, while Appendix D / Fig. 6(b)
+    # report K (the candidate-vocabulary cap, our candidate_pool_size) is flat from
+    # 32 to 512 -- so W is what to set, and K is not worth sweeping.
+    SGLANG_DFLASH_TFM_DARTREE_BEAM = EnvInt(12)
+    # Tree-shape diagnostics. Calls .item(), so it cannot run under CUDA graph
+    # capture; off by default to keep the DARTree path capturable.
+    SGLANG_DFLASH_TFM_DARTREE_STATS = EnvBool(False)
     SGLANG_DFLASH_TFM_NO_TREE_GRAPH = EnvBool(False)
     # Depth bonus beta in the DARTree prefix score s_beta = sum(log q) +
     # beta * depth, applied to the frontier selection priority only. Must be

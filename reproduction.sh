@@ -141,6 +141,7 @@ cmd_serve_ar() {
     --disable-radix-cache \
     --decode-attention-backend trtllm_mha \
     --prefill-attention-backend flashinfer \
+    --disable-overlap-schedule \
     --host 127.0.0.1 \
     --port "$PORT"
 }

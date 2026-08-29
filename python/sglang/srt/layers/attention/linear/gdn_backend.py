@@ -10,6 +10,7 @@ from sglang.srt.layers.attention.fla.chunk_tree_verify import (
     build_tree_ancestor_masks,
     chunk_gated_delta_rule_tree_verify,
     chunk_gated_delta_rule_tree_verify_fused,
+    chunk_gated_delta_rule_tree_verify_neumann,
     derive_tree_parent_tokens,
     tree_mask_capacity,
     tree_verify_conv1d_update,
@@ -338,6 +339,22 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if gdn_dflash_tfm_tree_verify_enabled(model_runner.server_args):
                 raise ValueError(msg + " Refusing recurrent fallback for DFLASH_TFM.")
             rank0_log(msg + " Falling back to the recurrent verify kernel.")
+        # Bound on the proposal tree's depth, for Bole's finite Neumann series.
+        # Bole builds this once per round and reuses it across layers and heads;
+        # here it is stronger than that -- a config property rather than data --
+        # so it is a compile-time constant and never forces a host sync, which a
+        # .item() would, breaking CUDA graph capture. A tree of N draft tokens is
+        # at worst a chain of depth N-1. The drafter's block size makes real trees
+        # much shallower, but correctness sets the direction: extra terms are
+        # exactly zero because G is nilpotent, too few terms are simply wrong.
+        # None lets the kernel use its profiled default term count. The depth
+        # bound is what EXACTNESS needs, but the series saturates at the bf16
+        # floor after two terms on this model (q/k are l2-normed, so max|G| ~
+        # 0.13) and every further term is measurable cost. Set the env var to
+        # force the full depth if a drafter ever produces trees where |G|
+        # approaches its 1.0 bound.
+        forced = int(envs.SGLANG_GDN_TREE_VERIFY_NEUMANN_TERMS.get() or 0)
+        self._max_tree_depth = forced if forced > 0 else None
         self.tree_verify_stash = None
         self.last_target_verify_used_tree = False
 
@@ -821,18 +838,27 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # The fused variant folds recompute_w_u into the output kernel, so the
         # [B,T,H,K] w and [B,T,H,V] u intermediates are never allocated. Same
         # semantics; behind a knob until its equivalence gate has run on GPU.
-        verify_fn = (
-            chunk_gated_delta_rule_tree_verify_fused
-            if envs.SGLANG_GDN_TREE_VERIFY_FUSED_WU.get()
-            else chunk_gated_delta_rule_tree_verify
-        )
+        # Bole's Neumann path drops the KKT solve and recompute_w_u entirely, so
+        # it is selected ahead of the w/u fusion (which only removes the latter).
+        use_neumann = envs.SGLANG_GDN_TREE_VERIFY_NEUMANN.get()
+        if use_neumann:
+            verify_fn = chunk_gated_delta_rule_tree_verify_neumann
+        elif envs.SGLANG_GDN_TREE_VERIFY_FUSED_WU.get():
+            verify_fn = chunk_gated_delta_rule_tree_verify_fused
+        else:
+            verify_fn = chunk_gated_delta_rule_tree_verify
         if not GDNAttnBackend._fused_wu_logged:
             GDNAttnBackend._fused_wu_logged = True
             logger.info(
-                "GDN tree verify: %s w/u path",
-                "FUSED" if envs.SGLANG_GDN_TREE_VERIFY_FUSED_WU.get() else "separate",
+                "GDN tree verify: %s path (max_tree_depth=%s)",
+                "BOLE-NEUMANN"
+                if use_neumann
+                else ("FUSED w/u" if envs.SGLANG_GDN_TREE_VERIFY_FUSED_WU.get() else "separate w/u"),
+                self._max_tree_depth,
             )
+        extra = {"max_tree_depth": self._max_tree_depth} if use_neumann else {}
         o = verify_fn(
+            **extra,
             q=query.view(bs, T, Hg, K),
             k=key.view(bs, T, Hg, K),
             v=value.view(bs, T, H, V),

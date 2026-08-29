@@ -708,6 +708,9 @@ class Envs:
     # positive gap is a proof of leakage. Off by default.
     # Legacy host-loop accept-path extraction. Kept only to measure the
     # vectorised path against it at matched seeds.
+    # First-error depth histogram. L2R and PARD-2 both weight positions by where
+    # acceptance stops; this measures whether their premise holds here.
+    SGLANG_DFLASH_TFM_DUMP_ACCEPT = EnvBool(False)
     SGLANG_DFLASH_TFM_LOOP_VERIFY = EnvBool(False)
     SGLANG_DFLASH_TFM_LOSSLESS_AUDIT = EnvBool(False)
     SGLANG_DFLASH_TFM_LOSSLESS_AUDIT_EVERY = EnvInt(2000)

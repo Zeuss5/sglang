@@ -2027,6 +2027,14 @@ def _traversal_verify_target_probs(
 
 
 class DFlashTfmVerifyInput(DFlashVerifyInput):
+    # CLASS-level, not instance: this object is constructed once per verify step,
+    # so instance counters reset every call and never reach a report threshold.
+    _accept_hist = None
+    _accept_steps = 0
+    # 1024, not 4096: at c1 a step contributes ONE draft, so a 4096 threshold
+    # needs more steps than a short benchmark runs and the histogram never prints.
+    _accept_report_every = 1024
+
     def __init__(
         self,
         *,
@@ -2155,6 +2163,52 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             req_to_token,
             kv_start_idx,
         )
+
+
+    def _dump_accept_stats(self, batch, accept_index, num_correct):
+        """Where along the draft does acceptance stop?
+
+        L2R weights the FIRST ERROR because that is what terminates a draft: every
+        token after it is discarded regardless of quality. PARD-2 weights positions
+        by prefix-survival probability for the same reason. Both premises are
+        claims about WHERE errors fall, and neither has been checked on this
+        system -- so measure the distribution before shaping a loss around it.
+
+        num_correct[b] is the count of accepted DRAFT tokens, so the first error
+        sits at depth num_correct[b] (0 means the very first draft token was
+        already wrong). Accumulates on device and reports periodically; costs one
+        bincount per step.
+        """
+        try:
+            with torch.no_grad():
+                d = num_correct.to(torch.long).clamp(min=0, max=self.draft_token_num)
+                if DFlashTfmVerifyInput._accept_hist is None:
+                    DFlashTfmVerifyInput._accept_hist = torch.zeros(
+                        self.draft_token_num + 1, dtype=torch.long, device=d.device
+                    )
+                DFlashTfmVerifyInput._accept_hist += torch.bincount(
+                    d, minlength=self.draft_token_num + 1
+                )
+                DFlashTfmVerifyInput._accept_steps += d.numel()
+                if DFlashTfmVerifyInput._accept_steps >= DFlashTfmVerifyInput._accept_report_every:
+                    h = DFlashTfmVerifyInput._accept_hist.tolist()
+                    tot = max(sum(h), 1)
+                    cum, lines = 0, []
+                    for i, n in enumerate(h):
+                        if n == 0:
+                            continue
+                        cum += n
+                        lines.append(f"{i}:{n / tot:.3f}({cum / tot:.3f})")
+                    logger.warning(
+                        "DFLASH_TFM first-error depth over %d drafts "
+                        "[depth:frac(cumulative)]: %s | mean accepted %.3f",
+                        tot, " ".join(lines),
+                        sum(i * n for i, n in enumerate(h)) / tot,
+                    )
+                    DFlashTfmVerifyInput._accept_hist = None
+                    DFlashTfmVerifyInput._accept_steps = 0
+        except Exception as exc:
+            logger.warning("DFLASH_TFM accept-stat dump skipped: %s", exc)
 
     def _verify_from_target_predict(self, target_predict: torch.Tensor, bs: int):
         candidates = self.draft_token.view(bs, self.draft_token_num)
@@ -2390,6 +2444,8 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         # Semantics preserved exactly: the old loop broke at the FIRST -1, so a row
         # is the prefix before it, not every non-negative entry. `argmax` on the
         # boolean gives that first index; rows with no -1 take the full width.
+        if envs.SGLANG_DFLASH_TFM_DUMP_ACCEPT.get():
+            self._dump_accept_stats(batch, accept_index, num_correct)
         _loop_verify = envs.SGLANG_DFLASH_TFM_LOOP_VERIFY.get()
         if not DFlashTfmWorker._accept_path_logged:
             DFlashTfmWorker._accept_path_logged = True

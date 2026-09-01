@@ -1715,7 +1715,7 @@ class Weaver(nn.Module):
         logits = candidate_scores.float() + residual
         logits = logits.masked_fill(candidate_ids < 0, -torch.inf)
         if _train_dump_active():
-            _train_capture_root(candidate_ids, candidate_scores, query, logits)
+            _train_capture_pool(candidate_ids, candidate_scores, logits)
         return logits, torch.stack(current_key_layers), torch.stack(current_value_layers)
 
     def step_chain(
@@ -2995,7 +2995,8 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
 # allocation a global top-N would have produced. Enabled by
 # SGLANG_DFLASH_TFM_DCUT_PROBE; off by default and free when off.
 _DCUT_STATE = {"calls": 0}
-_TRAIN_STATE = {"pending": None, "recs": [], "done": False}
+_TRAIN_STATE = {"pools": [], "slots": [], "recs": [], "done": False,
+                "draft_token_num": 0}
 
 
 def _train_dump_active() -> bool:
@@ -3003,46 +3004,72 @@ def _train_dump_active() -> bool:
             and not _TRAIN_STATE["done"])
 
 
-def _train_capture_root(candidate_ids, candidate_scores, query, logits) -> None:
-    """Stash the ROOT expansion's inputs -- the first Weaver call of a build.
+def _train_capture_pool(candidate_ids, candidate_scores, logits) -> None:
+    """Append ONE expansion's candidate pool, pre- and post-Weaver.
 
-    Weaver is a pure re-ranker:
-        logits = candidate_scores + (lm_head[candidate_ids] @ lm_head_query_in) @ query
-    so (ids, scores, query) plus the frozen lm_head reconstructs the scoring
-    exactly, at ~7 KB/row instead of the 4 MB it would cost to store
-    candidate_weights itself.
+    The depth-2+ question is whether the re-ranker improves on DFlash's own
+    ordering, which needs only (ids, scores, logits, label). `query` is dropped
+    here -- it is the largest field (4 KB/row) and is only needed to TRAIN, not
+    to diagnose.
     """
-    if _TRAIN_STATE["pending"] is not None:
-        return
-    _TRAIN_STATE["pending"] = (
+    _TRAIN_STATE["pools"].append((
         candidate_ids.detach().to("cpu", torch.int32).clone(),
         candidate_scores.detach().to("cpu", torch.float16).clone(),
-        query.detach().to("cpu", torch.float16).clone(),
-        # Post-Weaver logits. Costs 1 KB/row and answers the sharpest form of the
-        # Phase 3 question WITHOUT needing the 2.5 GB lm_head offline: does the
-        # re-ranker improve on DFlash's own ordering, or degrade it?
         logits.detach().to("cpu", torch.float16).clone(),
-    )
+    ))
+
+
+def _train_note_slots(slots, depths) -> None:
+    """Record which tree slots the NEXT expansion call belongs to.
+
+    Round k writes new nodes at slot_slice and then expands exactly those nodes,
+    so the k-th expansion's pool belongs to those parents. Call this immediately
+    BEFORE the matching expansion or the two lists desynchronise.
+    """
+    _TRAIN_STATE["slots"].append((slots, depths))
 
 
 def _train_attach_labels(predict, accept_index, bs: int) -> None:
-    """Join the stashed root pool with the token the target actually emitted."""
-    pend = _TRAIN_STATE["pending"]
-    _TRAIN_STATE["pending"] = None
-    if pend is None or predict is None or accept_index is None:
+    """Join each recorded expansion with the token the target emitted at its parent."""
+    pools = _TRAIN_STATE["pools"]; slots = _TRAIN_STATE["slots"]
+    _TRAIN_STATE["pools"] = []; _TRAIN_STATE["slots"] = []
+    if predict is None or not pools or len(pools) != len(slots):
         return
-    ids, scores, query, lg = pend
-    if ids.shape[0] < bs:
-        return                      # expansion row count did not match the batch
+    T = _TRAIN_STATE.get("draft_token_num") or 0
+    if T <= 0:
+        return
+    flat = predict.detach().view(-1).to("cpu", torch.int32)
+    # ONLY NODES ON THE ACCEPTED PATH HAVE A MEANINGFUL LABEL. predict[] is
+    # written by the verify kernel along the committed path; at nodes the walk
+    # never reached it holds stale state, not "the token the target wanted here".
+    # Without this filter the depth>=2 rows are ~83% garbage labels, and the
+    # in-pool rate collapses from 0.99 at the root to 0.17 -- which reads like a
+    # drafter failure and is actually a measurement artefact.
+    onpath = torch.zeros(flat.numel(), dtype=torch.bool)
+    ai = accept_index.detach().reshape(-1).to("cpu").long()
+    ai = ai[(ai >= 0) & (ai < flat.numel())]
+    onpath[ai] = True
     try:
-        root = accept_index[:, 0].clamp(min=0)
-        label = predict.view(-1)[root].detach().to("cpu", torch.int32).clone()
-        _TRAIN_STATE["recs"].append(
-            (ids[:bs], scores[:bs], query[:bs], label[:bs], lg[:bs]))
+        for (ids, sc, lg), (sl, dp) in zip(pools, slots):
+            sl = sl.to("cpu").reshape(-1)              # [bs*width] tree slots
+            dp = dp.to("cpu").reshape(-1)
+            rows = sl.shape[0]
+            if ids.shape[0] < rows:
+                continue
+            b_of = torch.arange(rows) // max(rows // bs, 1)
+            gidx = (b_of * T + sl.long()).clamp(0, flat.numel() - 1)
+            keep = onpath[gidx]
+            if not bool(keep.any()):
+                continue
+            lab = flat[gidx][keep]
+            _TRAIN_STATE["recs"].append(
+                (ids[:rows][keep], sc[:rows][keep], lg[:rows][keep], lab,
+                 dp.to(torch.int16)[keep]))
     except Exception as exc:
         logger.warning("DFLASH_TFM train dump: label join failed: %s", exc)
         return
-    if len(_TRAIN_STATE["recs"]) >= envs.SGLANG_DFLASH_TFM_TRAIN_DUMP.get():
+    n = sum(r[0].shape[0] for r in _TRAIN_STATE["recs"])
+    if n >= envs.SGLANG_DFLASH_TFM_TRAIN_DUMP.get():
         _TRAIN_STATE["done"] = True
         path = "/artifacts/train_dump.pt"
         try:
@@ -3050,16 +3077,11 @@ def _train_attach_labels(predict, accept_index, bs: int) -> None:
             torch.save({
                 "pool_ids": torch.cat([r[0] for r in _TRAIN_STATE["recs"]]),
                 "scores": torch.cat([r[1] for r in _TRAIN_STATE["recs"]]),
-                "query": torch.cat([r[2] for r in _TRAIN_STATE["recs"]]),
+                "logits": torch.cat([r[2] for r in _TRAIN_STATE["recs"]]),
                 "label": torch.cat([r[3] for r in _TRAIN_STATE["recs"]]),
-                "logits": torch.cat([r[4] for r in _TRAIN_STATE["recs"]]),
+                "depth": torch.cat([r[4] for r in _TRAIN_STATE["recs"]]),
             }, path)
-            n = sum(r[0].shape[0] for r in _TRAIN_STATE["recs"])
-            logger.warning(
-                "DFLASH_TFM train dump: wrote %d steps / %d rows to %s "
-                "(pool %s, query %s)", len(_TRAIN_STATE["recs"]), n, path,
-                tuple(_TRAIN_STATE["recs"][0][0].shape),
-                tuple(_TRAIN_STATE["recs"][0][2].shape))
+            logger.warning("DFLASH_TFM train dump: wrote %d rows to %s", n, path)
         except Exception as exc:
             logger.warning("DFLASH_TFM train dump failed: %s", exc)
 
@@ -4287,6 +4309,10 @@ class DFlashTfmWorker(DFlashWorkerV2):
         root_prefix_score = torch.zeros((bs,), dtype=torch.float32, device=device)
         root_depth = torch.zeros((bs,), dtype=torch.long, device=device)
         root_active = torch.ones((bs,), dtype=torch.bool, device=device)
+        if _train_dump_active():
+            _TRAIN_STATE["draft_token_num"] = int(num_nodes)
+            _train_note_slots(torch.zeros(bs, 1, dtype=torch.long),
+                              torch.zeros(bs, 1, dtype=torch.long))
         root_logits, root_candidate_ids, root_keys, root_values = expand_node_indexed(
             root_ids,
             root_depth,
@@ -4398,6 +4424,11 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 row_base.expand(bs, width).reshape(bs * width).contiguous()
             )
 
+            if _train_dump_active():
+                _sl = torch.arange(
+                    slot_slice.start, slot_slice.stop
+                ).unsqueeze(0).expand(bs, -1)
+                _train_note_slots(_sl, node_depth.detach().to("cpu"))
             logits, row_candidate_ids, current_keys, current_values = expand_node_indexed(
                 token_flat,
                 node_depth_flat,

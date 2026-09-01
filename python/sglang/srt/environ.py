@@ -714,6 +714,26 @@ class Envs:
     SGLANG_DFLASH_TFM_LOOP_VERIFY = EnvBool(False)
     SGLANG_DFLASH_TFM_LOSSLESS_AUDIT = EnvBool(False)
     SGLANG_DFLASH_TFM_LOSSLESS_AUDIT_EVERY = EnvInt(2000)
+    # Prefix-probability (rho) dump for offline dynamic-sizing replay. Number of
+    # build steps to capture, then write and stop; 0 = off. The sizing rule has
+    # content ONLY as a runtime rho -> node-count map, because any offline check
+    # using measured tau is algebraically circular (see DYNAMIC_SIZING.md).
+    SGLANG_DFLASH_TFM_RHO_DUMP = EnvInt(0)
+    # Phase 3 training data: number of build steps to capture. Captures the
+    # ROOT node's candidate pool, its DFlash scores, Weaver's query, and the
+    # token the target actually emitted there. Requires NO_TREE_GRAPH=1:
+    # the hook lives in the Weaver forward, which is otherwise replayed
+    # from a captured graph and never runs.
+    SGLANG_DFLASH_TFM_TRAIN_DUMP = EnvInt(0)
+    # Build steps to SKIP before recording. The first few hundred steps of a
+    # serving run are warmup at batch 1, which answers a question the papers
+    # already answered; the c32 steady state is what we need.
+    SGLANG_DFLASH_TFM_RHO_DUMP_SKIP = EnvInt(0)
+    # Record only steps whose batch is at least this large. Stepping past
+    # warmup by a fixed count is unreliable: a c32 run is only ~2700 build
+    # steps, so a large skip lands in the DRAIN TAIL where the batch is back
+    # to 1. Filtering on batch size targets steady state directly.
+    SGLANG_DFLASH_TFM_RHO_DUMP_MIN_BS = EnvInt(1)
     SGLANG_DFLASH_TFM_EXPAND_WIDTH = EnvInt(8)
     SGLANG_DFLASH_TFM_TARGET_ROWS = EnvInt(0)
     SGLANG_DFLASH_TFM_BUDGET_SCHEDULE = EnvStr("")

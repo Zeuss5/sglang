@@ -100,6 +100,8 @@ cmd_exec() {
     -e MAX_RUNNING="$MAX_RUNNING" \
     -e MEM_FRACTION="$MEM_FRACTION" \
     -e GRAPH_MAX_BS="$GRAPH_MAX_BS" \
+    -e RADIX="${RADIX:-off}" \
+    -e PAGE_SIZE="${PAGE_SIZE:-64}" \
     -e BASE_URL="$BASE_URL" \
     --ipc=host --network=host --privileged \
     --name "hydraflash-p${PORT}" \
@@ -129,6 +131,12 @@ run_in_container() {
 
 cmd_serve_ar() {
   export_common_env
+  # Every published baseline was measured with the prefix cache OFF,
+  # which production would not do. Default preserves that so earlier
+  # runs stay comparable; RADIX=on turns it back on.
+  PAGE_SIZE="${PAGE_SIZE:-64}"
+  RADIX_ARG="--disable-radix-cache"
+  [ "${RADIX:-off}" = "on" ] && RADIX_ARG=""
   python3 -m sglang.launch_server \
     --model-path "$TARGET_MODEL" \
     --revision "$TARGET_REV" \
@@ -137,8 +145,8 @@ cmd_serve_ar() {
     --max-running-requests "$MAX_RUNNING" \
     --cuda-graph-max-bs "$GRAPH_MAX_BS" \
     --mem-fraction-static "$MEM_FRACTION" \
-    --page-size 64 \
-    --disable-radix-cache \
+    --page-size "$PAGE_SIZE" \
+    ${RADIX_ARG} \
     --decode-attention-backend trtllm_mha \
     --prefill-attention-backend flashinfer \
     --disable-overlap-schedule \

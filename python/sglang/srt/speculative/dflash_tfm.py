@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import List, Optional, Tuple
 
 import msgspec
@@ -1713,6 +1714,8 @@ class Weaver(nn.Module):
         )
         logits = candidate_scores.float() + residual
         logits = logits.masked_fill(candidate_ids < 0, -torch.inf)
+        if _train_dump_active():
+            _train_capture_root(candidate_ids, candidate_scores, query, logits)
         return logits, torch.stack(current_key_layers), torch.stack(current_value_layers)
 
     def step_chain(
@@ -1774,6 +1777,13 @@ class WeaverTree(msgspec.Struct):
     # Per-node drafter pool and the residual distribution ms it was sampled from.
     pool_ids: torch.Tensor
     pool_ms: torch.Tensor
+    # Per-node PREFIX score (cumulative normalised draft logprob along the path)
+    # == CaDDTree's log rho. Carried as a graph OUTPUT because the builder is
+    # CUDA-graphed: a Python hook inside the build loop runs once per shape at
+    # capture, never per step -- which is why the rho dump and the D-cut probe
+    # both produced zero lines across every run ever recorded. A static tensor
+    # written inside the graph is refreshed by every replay and readable after it.
+    node_scores: Optional[torch.Tensor] = None
 
 
 class WeaverTreeCudaGraph(msgspec.Struct):
@@ -2031,13 +2041,32 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
     # so instance counters reset every call and never reach a report threshold.
     _accept_hist = None
     _accept_steps = 0
+    # Losslessness-audit accumulators. CLASS level, not instance: this object is
+    # constructed fresh every verify step, so instance counters reset before they
+    # can ever reach _audit_every and the audit stays permanently silent. Each
+    # entry is [sum_expected, sum_observed, sum_variance].
+    _audit_acc = None
+    _audit_top = None
+    _audit_set = None
+    _audit_det = None
+    _audit_smp = None
+    _audit_spath = None
+    _audit_n = 0
+    _audit_every = 2000
+    _audit_shape_logged = False
     _pool_hit = 0
     _pool_tot = 0
     _pool_nz = 0
     _pool_cells = 0
     _rank_sum = 0.0
     _rank_n = 0
-    _rank_le = {8: 0, 16: 0, 64: 0}
+    # Buckets 2 and 4 are the ones that GATE acceptance: the tree selects
+    # batch_expand_width children per node (2 at c32), so the target must
+    # land in the top-w, not merely the top-8. Without these the rank
+    # distribution is measured at a threshold nothing uses.
+    _rank_le = {2: 0, 4: 0, 8: 0, 16: 0, 64: 0}
+    _promoted_yes = 0
+    _promoted_no = 0
     _max_seen_depth = 1
     # 1024, not 4096: at c1 a step contributes ONE draft, so a 4096 threshold
     # needs more steps than a short benchmark runs and the histogram never prints.
@@ -2093,10 +2122,9 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         # verify() and consumed by the post-verify Mamba/GDN state commit.
         self.accept_leaf_slots: Optional[torch.Tensor] = None
         # Lossless audit accumulators (SGLANG_DFLASH_TFM_LOSSLESS_AUDIT).
-        self._audit_exp = 0.0
-        self._audit_obs = 0.0
-        self._audit_n = 0
-        self._audit_every = envs.SGLANG_DFLASH_TFM_LOSSLESS_AUDIT_EVERY.get()
+        DFlashTfmVerifyInput._audit_every = (
+            envs.SGLANG_DFLASH_TFM_LOSSLESS_AUDIT_EVERY.get()
+        )
 
 
     def prepare_for_verify(
@@ -2247,7 +2275,33 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                         r = rank[good].to(torch.float32)
                         DFlashTfmVerifyInput._rank_sum += float(r.sum().item())
                         DFlashTfmVerifyInput._rank_n += int(good.sum().item())
-                        for k, thr in ((8, 8), (16, 16), (64, 64)):
+                        # DID WEAVER PROMOTE IT? pool_ms is the residual draft
+                        # distribution, which the builder computes AFTER zeroing
+                        # the deterministic children -- so ms == 0 at a pool
+                        # column means Weaver ranked that token into the selected
+                        # children, and ms > 0 means it did not. No new storage:
+                        # pool_ms is already persisted for verification.
+                        #
+                        # This separates the two readings of "target at rank < 8":
+                        #   ms > 0  -> Weaver DEMOTED it. A re-ranker can fix this.
+                        #   ms == 0 -> Weaver promoted it and it still failed, so
+                        #              the cause is budget pruning or (at T>0)
+                        #              probabilistic rejection -- NOT re-ranking.
+                        if self.pool_ms is not None:
+                            ms_all = self.pool_ms.view(
+                                bs_, self.draft_token_num, -1
+                            )[rows, local.clamp(min=0,
+                                                max=self.draft_token_num - 1)]
+                            col = match.to(torch.uint8).argmax(dim=1)
+                            ms_at = ms_all.gather(1, col[:, None]).squeeze(1)
+                            promoted = (ms_at <= 0) & good
+                            DFlashTfmVerifyInput._promoted_yes += int(
+                                promoted.sum().item()
+                            )
+                            DFlashTfmVerifyInput._promoted_no += int(
+                                (good & ~promoted).sum().item()
+                            )
+                        for k, thr in ((2, 2), (4, 4), (8, 8), (16, 16), (64, 64)):
                             DFlashTfmVerifyInput._rank_le[thr] += int(
                                 (r < thr).sum().item()
                             )
@@ -2278,9 +2332,14 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                         f" | maxdepth {DFlashTfmVerifyInput._max_seen_depth}"
                         f" | tgt rank in pool: mean "
                         f"{DFlashTfmVerifyInput._rank_sum / max(DFlashTfmVerifyInput._rank_n, 1):.1f}"
+                        f" <2:{DFlashTfmVerifyInput._rank_le[2] / max(DFlashTfmVerifyInput._rank_n, 1):.3f}"
+                        f" <4:{DFlashTfmVerifyInput._rank_le[4] / max(DFlashTfmVerifyInput._rank_n, 1):.3f}"
                         f" <8:{DFlashTfmVerifyInput._rank_le[8] / max(DFlashTfmVerifyInput._rank_n, 1):.3f}"
                         f" <16:{DFlashTfmVerifyInput._rank_le[16] / max(DFlashTfmVerifyInput._rank_n, 1):.3f}"
                         f" <64:{DFlashTfmVerifyInput._rank_le[64] / max(DFlashTfmVerifyInput._rank_n, 1):.3f}"
+                        f" | weaver DEMOTED (fixable by re-rank):"
+                        f" {DFlashTfmVerifyInput._promoted_no / max(DFlashTfmVerifyInput._promoted_no + DFlashTfmVerifyInput._promoted_yes, 1):.3f}"
+                        f" promoted-but-failed: {DFlashTfmVerifyInput._promoted_yes / max(DFlashTfmVerifyInput._promoted_no + DFlashTfmVerifyInput._promoted_yes, 1):.3f}"
                         if pt else ""
                     )
                     DFlashTfmVerifyInput._pool_hit = 0
@@ -2289,7 +2348,9 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                     DFlashTfmVerifyInput._pool_cells = 0
                     DFlashTfmVerifyInput._rank_sum = 0.0
                     DFlashTfmVerifyInput._rank_n = 0
-                    DFlashTfmVerifyInput._rank_le = {8: 0, 16: 0, 64: 0}
+                    DFlashTfmVerifyInput._rank_le = {2: 0, 4: 0, 8: 0, 16: 0, 64: 0}
+                    DFlashTfmVerifyInput._promoted_yes = 0
+                    DFlashTfmVerifyInput._promoted_no = 0
                     logger.warning(
                         "DFLASH_TFM first-error depth over %d drafts "
                         "[depth:frac(cumulative)]: %s | mean accepted %.3f%s",
@@ -2422,66 +2483,279 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             pool_ms=self.pool_ms,
             univer_ok=self.univer_ok,
         )
+        if _train_dump_active():
+            _train_attach_labels(predict, accept_index, bs)
         if envs.SGLANG_DFLASH_TFM_LOSSLESS_AUDIT.get():
-            self._audit_losslessness(target_probs, candidates, num_correct)
+            self._audit_losslessness(
+                target_probs, candidates, num_correct, predict, accept_index
+            )
         return predict, accept_index, num_correct
 
-    def _audit_losslessness(self, target_probs, candidates, num_correct):
-        """Empirical check of the one identity losslessness forces at the root.
+    def _audit_losslessness(
+        self, target_probs, candidates, num_correct, predict, accept_index
+    ):
+        """Empirical check of the identities losslessness forces at the root.
 
-        For a candidate set C fixed given the drafter's output, ANY lossless rule
-        emits a token distributed exactly as the target, so acceptance at the root
-        (where the path probability p_tilde is 1) satisfies
+        A lossless verifier emits x ~ p_target EXACTLY. So for any set S fixed
+        before x is drawn, P(x in S) = p_target(S). Three such identities are
+        scored, all at the root, where the path probability is 1:
 
-            P(accept at least one token)  =  sum_{c in C} p_target(c)
+          A  acceptance    e = p(C),  o = 1[accepted >= 1 token]
+          B  emission@top  e = p(c1), o = 1[emitted == c1]   c1 = drafter's pick
+          C  emission@set  e = p(C),  o = 1[emitted in C]
 
-        This is an identity, not a bound -- see Hu et al. (arXiv 2502.18779) Eq. 8,
-        SpecTr Lemma 3, UniVer Theorem 5, Not-a-Bandit Theorem 2. So the observed
-        root accept rate must converge to the mean of that sum, and ANY persistent
-        positive gap is a proof of leakage: the verifier is emitting the drafter's
-        preferred token more often than the target distribution allows.
+        A ALONE IS NOT ENOUGH, and that is the whole point of B. The acceptance
+        identity constrains only how OFTEN we accept, never WHICH token comes
+        out. A verifier that accepts at exactly the right rate but skews the
+        conditional emission toward the drafter's favourite is a real
+        losslessness break that A passes cleanly: `tools/test_lossless_audit.py`
+        exhibits one at emission TV >= 0.208 that A scores at z = 0.4 while B
+        scores it at z = 63.5. A catches gross over-acceptance (the original
+        top-K cascade defect, z = 246); B catches everything A is blind to.
 
-        This is the check that would have caught the original T>0 defect on day one
-        (top-K children scored by the cascade over-accepted, measured TV 0.55-0.73).
-        Off by default; costs two reductions per step when on.
+        One-sided by construction: only accepting or emitting MORE than the
+        target permits is leakage. Under-acceptance is inefficiency, not a
+        correctness bug, and flagging it burns the gate's credibility.
+
+        Variance is summed per step -- Var(sum o_i) = sum e_i(1-e_i) -- not taken
+        from the pooled mean. x(1-x) is concave, so the pooled form is an upper
+        bound (Jensen) and costs real power.
+
+        CAVEAT, and it is why the threshold stays at 4 rather than tightening:
+        this treats every row as independent, but consecutive decode steps of the
+        SAME request are correlated, and 2000 rows at batch ~30 is only ~67 steps
+        spanning a few dozen requests. The effective sample size is therefore well
+        below n, the variance is understated, and |z| runs optimistically high.
+        Read values between 2 and 4 as "not resolved", not as "clean".
+
+        Off by default; costs a few reductions per step when on.
         """
         try:
             with torch.no_grad():
                 bs = target_probs.shape[0]
-                # Root children are the depth-1 nodes: parent index 0, excluding
-                # the root itself.
-                parents = self.parent_indices.view(bs, -1)
-                idx = torch.arange(parents.shape[1], device=parents.device)
-                is_root_child = (parents == 0) & (idx.unsqueeze(0) != 0)
+                cls = DFlashTfmVerifyInput
+                if cls._audit_acc is None:
+                    cls._audit_acc = [0.0, 0.0, 0.0]
+                    cls._audit_top = [0.0, 0.0, 0.0]
+                    cls._audit_set = [0.0, 0.0, 0.0]
+                    cls._audit_det = [0.0, 0.0, 0.0]
+                    cls._audit_smp = [0.0, 0.0, 0.0]
+                    cls._audit_spath = [0.0, 0.0]
+                    cls._audit_n = 0
+
+                # Root children are the DEPTH-1 nodes. `depths` is row-local with
+                # the root at 0, so this is unambiguous. Inferring them from
+                # `parent_indices == 0` instead under-selected the set, which made
+                # p(C) too small and showed up as a phantom +45 to +62 sigma LEAK
+                # on the acceptance test while both emission tests stayed clean --
+                # the signature of a wrong C rather than a wrong verifier, since
+                # C_set uses the same C on both sides and cancels.
+                depths = self.depths.view(bs, -1)
+                is_root_child = depths == 1
                 if self.node_mask is not None:
                     is_root_child &= self.node_mask.view(bs, -1).bool()
+
                 cand = candidates.view(bs, -1).to(torch.int64)
-                # p_target at the ROOT position, gathered at each child's token.
                 root_probs = target_probs[:, 0, :]
-                child_p = torch.gather(root_probs, 1, cand) * is_root_child
-                # Duplicate tokens among siblings would double-count the identity.
-                expected = child_p.sum(dim=1).clamp(max=1.0)
-                observed = (num_correct.view(bs) >= 1).to(expected.dtype)
-                self._audit_exp += float(expected.sum())
-                self._audit_obs += float(observed.sum())
-                self._audit_n += bs
-                if self._audit_n >= self._audit_every:
-                    e = self._audit_exp / self._audit_n
-                    o = self._audit_obs / self._audit_n
-                    gap = o - e
-                    # Binomial standard error on the observed rate.
-                    se = max((e * (1.0 - e) / self._audit_n) ** 0.5, 1e-9)
-                    z = gap / se
-                    verdict = "OK" if abs(z) < 4.0 else "LEAK"
+
+                # p(C) over UNIQUE tokens. Summing gathered probabilities
+                # double-counts duplicate siblings, which inflates the required
+                # rate and makes the gate look conservative when it is wrong.
+                #
+                # Write ONLY at real root children. `scatter_(1, cand,
+                # is_root_child)` writes for every node -- including False for
+                # non-children -- and deeper nodes routinely repeat a root child's
+                # token, so the later write clobbered the earlier True and silently
+                # dropped children from C. That understated p(C) AND P(emit in C)
+                # by the same amount, so C_set cancelled and stayed clean while
+                # A_acc read a phantom +50 sigma LEAK. Boolean advanced indexing
+                # touches only the selected cells and cannot clobber.
+                in_c = torch.zeros_like(root_probs, dtype=torch.bool)
+                rows = torch.arange(bs, device=cand.device).unsqueeze(1).expand_as(cand)
+                in_c[rows[is_root_child], cand[is_root_child]] = True
+                # NOTE: p_set is finalised AFTER p_smp is corrected below;
+                # see the sampled-child comment. C_set = D_det + S_dsg.
+
+                # LOCALISATION. The UniVer tree is EXPAND_WIDTH-1 DETERMINISTIC
+                # top-K children plus ONE sampled from the residual. Traversal
+                # Verification Def 3.1 only licenses min(1, cur_p*q/s) for
+                # candidates DRAWN with probability s, so if the deterministic
+                # children are verified as though drawn, the excess lands on them
+                # and grows with the mass outside the top-K, i.e. with temperature.
+                # Splitting the set on exactly that line tests it directly.
+                # Overlaps (a sampled child that duplicates a top-K token) are
+                # assigned to the deterministic side so the two groups stay
+                # disjoint and D + S == C.
+                smp_mask = is_root_child
+                if self.is_sampled is not None:
+                    smp_mask = is_root_child & self.is_sampled.view(bs, -1).bool()
+                else:
+                    smp_mask = torch.zeros_like(is_root_child)
+                det_mask = is_root_child & ~smp_mask
+                in_d = torch.zeros_like(in_c)
+                in_d[rows[det_mask], cand[det_mask]] = True
+                in_s = torch.zeros_like(in_c)
+                in_s[rows[smp_mask], cand[smp_mask]] = True
+                in_s &= ~in_d
+                p_det = (root_probs * in_d).sum(dim=1).clamp(max=1.0)
+
+                # The sampled child needs a DIFFERENT required value, and I got
+                # this wrong TWICE on 2026-08-30, each time producing a confident,
+                # replicated, false "leak". See tools/test_univer_root_identity.py,
+                # which validates the mechanism AND this bar on CPU.
+                #
+                # D is fixed given the draft, so P(X in D) = p(D) is a genuine
+                # identity -- D_det is the real losslessness test. The sampled
+                # child is NOT fixed: it is drawn from s, and UniVer is lossless
+                # only in EXPECTATION over that draw. Conditional on the realised
+                # tree the descend probability is min(p~*p(c)/s(c), 1), with no
+                # s(c) factor, so
+                #
+                #     P(X = C) = sum_c s(c)*min(p(c)/s(c), 1)
+                #              = sum_c min(p(c), s(c))          <- POOL-WIDE SUM
+                #
+                # It is NOT E_C[p(C)] (reads 19x leak) and NOT E_C[min(p(C),s(C))]
+                # (reads 66x leak). Both condition on the realised draw; the true
+                # value sums over the whole residual pool, whose per-token draw
+                # probabilities are exactly node_pool_ms.
+                p_smp = torch.zeros_like(p_det)
+                if self.pool_ids is not None and self.pool_ms is not None:
+                    root_ids = self.pool_ids.view(bs, -1, self.pool_ids.shape[-1])[:, 0, :]
+                    root_ms = self.pool_ms.view(bs, -1, self.pool_ms.shape[-1])[:, 0, :]
+                    root_ms = root_ms.to(root_probs.dtype)
+                    pool_p = root_probs.gather(1, root_ids.clamp(min=0).to(torch.int64))
+                    # ms is 0 on deterministic children, so they contribute 0 here
+                    # and the two groups stay disjoint.
+                    p_smp = torch.minimum(pool_p, root_ms).sum(dim=1).clamp(max=1.0)
+
+                p_set = (p_det + p_smp).clamp(max=1.0)
+
+                # c1: the drafter's favourite root child.
+                lp = self.draft_logprobs.view(bs, -1).float()
+                lp = lp.masked_fill(~is_root_child, float("-inf"))
+                has_child = is_root_child.any(dim=1)
+                c1_slot = lp.argmax(dim=1)
+                c1_tok = cand.gather(1, c1_slot.unsqueeze(1)).squeeze(1)
+                p_top = root_probs.gather(1, c1_tok.unsqueeze(1)).squeeze(1)
+
+                # The token actually emitted at the root position.
+                first = accept_index[:, 0]
+                emitted = predict.view(-1)[first.clamp(min=0)]
+                valid = has_child & (first >= 0)
+
+                obs_acc = (num_correct.view(bs) >= 1).to(root_probs.dtype)
+                obs_top = (emitted == c1_tok).to(root_probs.dtype)
+                obs_set = in_c.gather(1, emitted.unsqueeze(1)).squeeze(1).to(
+                    root_probs.dtype
+                )
+                obs_det = in_d.gather(1, emitted.unsqueeze(1)).squeeze(1).to(
+                    root_probs.dtype
+                )
+                obs_smp = in_s.gather(1, emitted.unsqueeze(1)).squeeze(1).to(
+                    root_probs.dtype
+                )
+
+                if not cls._audit_shape_logged:
+                    cls._audit_shape_logged = True
+                    parents = self.parent_indices.view(bs, -1)
+                    idx = torch.arange(parents.shape[1], device=parents.device)
+                    old_mask = (parents == 0) & (idx.unsqueeze(0) != 0)
+                    if self.node_mask is not None:
+                        old_mask = old_mask & self.node_mask.view(bs, -1).bool()
                     logger.warning(
-                        "DFLASH_TFM lossless audit [%s]: root accept observed "
-                        "%.4f vs required %.4f (gap %+.4f, %.1f sigma, n=%d). "
-                        "A persistent positive gap means the verifier accepts more "
-                        "than the target distribution permits.",
-                        verdict, o, e, gap, z, self._audit_n,
+                        "DFLASH_TFM audit tree shape: depth==1 gives %.2f root "
+                        "children/row, parent==0 gave %.2f; depth histogram %s",
+                        float(is_root_child.sum(1).float().mean()),
+                        float(old_mask.sum(1).float().mean()),
+                        torch.bincount(
+                            depths.reshape(-1).clamp(min=0), minlength=8
+                        )[:8].tolist(),
                     )
-                    self._audit_exp = self._audit_obs = 0.0
-                    self._audit_n = 0
+                    # What node does accept_index[:,0] actually point at? If it is
+                    # the ROOT slot (depth 0) then predict[] there is the first
+                    # emitted token, which is what the emission tests assume. If it
+                    # is depth 1 it is the first ACCEPTED child and the emission
+                    # tests are reading the second token, not the first.
+                    d_first = self.depths.reshape(-1)[first.clamp(min=0)]
+                    acc1 = (num_correct.view(bs) >= 1)
+                    inC = in_c.gather(1, emitted.unsqueeze(1)).squeeze(1)
+                    logger.warning(
+                        "DFLASH_TFM audit index probe: depth(accept_index[:,0]) "
+                        "histogram %s | P(acc>=1)=%.3f P(emit in C)=%.3f "
+                        "P(acc & !inC)=%.3f P(!acc & inC)=%.3f",
+                        torch.bincount(
+                            d_first.clamp(min=0).long(), minlength=4
+                        )[:4].tolist(),
+                        float(acc1.float().mean()), float(inC.float().mean()),
+                        float((acc1 & ~inC).float().mean()),
+                        float((~acc1 & inC).float().mean()),
+                    )
+
+
+                # PATH SPLIT for the sampled child. Losslessness constrains only
+                # the TOTAL, so there is no per-path identity -- but there is a
+                # bound: emission via acceptance is
+                #   s(c) * min(p~*p(c)/s(c), 1) = min(p~*p(c), s(c)) <= p~*p(c)
+                # so the accept path can never exceed p(S). If the RESIDUAL path
+                # alone exceeds p(S), the residual construction is the culprit and
+                # no further localisation is needed.
+                acc_any = num_correct.view(bs) >= 1
+                s_hit = in_s.gather(1, emitted.unsqueeze(1)).squeeze(1)
+                cls._audit_spath[0] += float(
+                    (s_hit & acc_any & valid).to(root_probs.dtype).sum()
+                )
+                cls._audit_spath[1] += float(
+                    (s_hit & ~acc_any & valid).to(root_probs.dtype).sum()
+                )
+
+                m = valid.to(root_probs.dtype)
+                for slot, e, o in (
+                    (cls._audit_acc, p_set, obs_acc),
+                    (cls._audit_top, p_top, obs_top),
+                    (cls._audit_set, p_set, obs_set),
+                    (cls._audit_det, p_det, obs_det),
+                    (cls._audit_smp, p_smp, obs_smp),
+                ):
+                    slot[0] += float((e * m).sum())
+                    slot[1] += float((o * m).sum())
+                    slot[2] += float((e * (1.0 - e) * m).sum())
+                cls._audit_n += int(valid.sum())
+
+                if cls._audit_n >= cls._audit_every:
+                    n = cls._audit_n
+                    zs = {}
+                    for name, slot in (("A_acc", cls._audit_acc),
+                                       ("B_emit", cls._audit_top),
+                                       ("C_set", cls._audit_set),
+                                       ("D_det", cls._audit_det),
+                                       ("S_dsg", cls._audit_smp)):
+                        zs[name] = (slot[1] - slot[0]) / max(slot[2] ** 0.5, 1e-9)
+                    worst = max(zs.values())
+                    verdict = "OK" if worst < 4.0 else "LEAK"
+                    logger.warning(
+                        "DFLASH_TFM lossless audit [%s] n=%d: "
+                        "A_acc %.4f vs %.4f (z=%+.1f)  "
+                        "B_emit %.4f vs %.4f (z=%+.1f)  "
+                        "C_set %.4f vs %.4f (z=%+.1f)  "
+                        "D_det %.4f vs %.4f (z=%+.1f)  "
+                        "S_dsg %.4f vs %.4f (z=%+.1f)  "
+                        "[S via accept %.4f | via residual %.4f, bound %.4f]. "
+                        "One-sided: z above +4 means the verifier accepts or "
+                        "emits more than the target distribution permits. "
+                        "B_emit is the test with power against emission skew.",
+                        verdict, n,
+                        cls._audit_acc[1] / n, cls._audit_acc[0] / n, zs["A_acc"],
+                        cls._audit_top[1] / n, cls._audit_top[0] / n, zs["B_emit"],
+                        cls._audit_set[1] / n, cls._audit_set[0] / n, zs["C_set"],
+                        cls._audit_det[1] / n, cls._audit_det[0] / n, zs["D_det"],
+                        cls._audit_smp[1] / n, cls._audit_smp[0] / n, zs["S_dsg"],
+                        cls._audit_spath[0] / n, cls._audit_spath[1] / n,
+                        cls._audit_smp[0] / n,
+                    )
+                    cls._audit_acc = cls._audit_top = cls._audit_set = None
+                    cls._audit_det = cls._audit_smp = None
+                    cls._audit_spath = None
+                    cls._audit_n = 0
         except Exception as exc:  # never let an audit break serving
             logger.warning("DFLASH_TFM lossless audit skipped: %s", exc)
 
@@ -2720,39 +2994,184 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
 # This probe records the prefix scores of selected nodes and reports the
 # allocation a global top-N would have produced. Enabled by
 # SGLANG_DFLASH_TFM_DCUT_PROBE; off by default and free when off.
-_DCUT_STATE = {"scores": [], "calls": 0, "reported": 0}
+_DCUT_STATE = {"calls": 0}
+_TRAIN_STATE = {"pending": None, "recs": [], "done": False}
+
+
+def _train_dump_active() -> bool:
+    return (envs.SGLANG_DFLASH_TFM_TRAIN_DUMP.get() > 0
+            and not _TRAIN_STATE["done"])
+
+
+def _train_capture_root(candidate_ids, candidate_scores, query, logits) -> None:
+    """Stash the ROOT expansion's inputs -- the first Weaver call of a build.
+
+    Weaver is a pure re-ranker:
+        logits = candidate_scores + (lm_head[candidate_ids] @ lm_head_query_in) @ query
+    so (ids, scores, query) plus the frozen lm_head reconstructs the scoring
+    exactly, at ~7 KB/row instead of the 4 MB it would cost to store
+    candidate_weights itself.
+    """
+    if _TRAIN_STATE["pending"] is not None:
+        return
+    _TRAIN_STATE["pending"] = (
+        candidate_ids.detach().to("cpu", torch.int32).clone(),
+        candidate_scores.detach().to("cpu", torch.float16).clone(),
+        query.detach().to("cpu", torch.float16).clone(),
+        # Post-Weaver logits. Costs 1 KB/row and answers the sharpest form of the
+        # Phase 3 question WITHOUT needing the 2.5 GB lm_head offline: does the
+        # re-ranker improve on DFlash's own ordering, or degrade it?
+        logits.detach().to("cpu", torch.float16).clone(),
+    )
+
+
+def _train_attach_labels(predict, accept_index, bs: int) -> None:
+    """Join the stashed root pool with the token the target actually emitted."""
+    pend = _TRAIN_STATE["pending"]
+    _TRAIN_STATE["pending"] = None
+    if pend is None or predict is None or accept_index is None:
+        return
+    ids, scores, query, lg = pend
+    if ids.shape[0] < bs:
+        return                      # expansion row count did not match the batch
+    try:
+        root = accept_index[:, 0].clamp(min=0)
+        label = predict.view(-1)[root].detach().to("cpu", torch.int32).clone()
+        _TRAIN_STATE["recs"].append(
+            (ids[:bs], scores[:bs], query[:bs], label[:bs], lg[:bs]))
+    except Exception as exc:
+        logger.warning("DFLASH_TFM train dump: label join failed: %s", exc)
+        return
+    if len(_TRAIN_STATE["recs"]) >= envs.SGLANG_DFLASH_TFM_TRAIN_DUMP.get():
+        _TRAIN_STATE["done"] = True
+        path = "/artifacts/train_dump.pt"
+        try:
+            os.makedirs("/artifacts", exist_ok=True)
+            torch.save({
+                "pool_ids": torch.cat([r[0] for r in _TRAIN_STATE["recs"]]),
+                "scores": torch.cat([r[1] for r in _TRAIN_STATE["recs"]]),
+                "query": torch.cat([r[2] for r in _TRAIN_STATE["recs"]]),
+                "label": torch.cat([r[3] for r in _TRAIN_STATE["recs"]]),
+                "logits": torch.cat([r[4] for r in _TRAIN_STATE["recs"]]),
+            }, path)
+            n = sum(r[0].shape[0] for r in _TRAIN_STATE["recs"])
+            logger.warning(
+                "DFLASH_TFM train dump: wrote %d steps / %d rows to %s "
+                "(pool %s, query %s)", len(_TRAIN_STATE["recs"]), n, path,
+                tuple(_TRAIN_STATE["recs"][0][0].shape),
+                tuple(_TRAIN_STATE["recs"][0][2].shape))
+        except Exception as exc:
+            logger.warning("DFLASH_TFM train dump failed: %s", exc)
+
+
+_RHO_STATE = {"steps": [], "budgets": [], "done": False, "seen": 0,
+              "bs_hist": {}}
 
 
 def _dcut_probe_active() -> bool:
     return envs.SGLANG_DFLASH_TFM_DCUT_PROBE.get()
 
 
-def _dcut_record(node_score: torch.Tensor, valid: torch.Tensor) -> None:
-    _DCUT_STATE["scores"].append(
-        torch.where(valid, node_score, torch.full_like(node_score, -float("inf")))
-        .detach()
-    )
-
-
-def _dcut_report(bs: int, node_budget: int) -> None:
-    """Compare uniform per-request allocation against a batch-global top-N."""
-    chunks = _DCUT_STATE["scores"]
-    _DCUT_STATE["scores"] = []
-    if not chunks:
+def _dcut_maybe_report(tree) -> None:
+    """Fire the D-cut probe every N build steps, from OUTSIDE the CUDA graph."""
+    if not _dcut_probe_active():
         return
-    scores = torch.cat(chunks, dim=1)              # [bs, selected]
+    scores = getattr(tree, "node_scores", None)
+    if scores is None:
+        return
+    _DCUT_STATE["calls"] += 1
+    if _DCUT_STATE["calls"] % 400 == 0:
+        _dcut_report(scores.detach(), int(scores.shape[1]) - 1)
+
+
+def _rho_dump_active() -> bool:
+    return envs.SGLANG_DFLASH_TFM_RHO_DUMP.get() > 0 and not _RHO_STATE["done"]
+
+
+def _rho_dump_record(tree) -> None:
+    """Persist per-step prefix probabilities for offline sizing replay.
+
+    Reads `tree.node_scores`, the cumulative normalised draft logprob along each
+    node's path -- exactly CaDDTree's log rho. Called from the builder DISPATCH,
+    after the CUDA graph has been replayed, because the buffer is a graph output
+    refreshed by every replay. A hook inside the build loop runs once per shape at
+    capture and is why this and the D-cut probe recorded nothing for so long.
+
+    Nodes are emitted in selection order (descending priority), which is the order
+    the sizing rule consumes them; the replay tool sorts defensively anyway.
+    """
+    _RHO_STATE["seen"] += 1
+    if _RHO_STATE["seen"] <= envs.SGLANG_DFLASH_TFM_RHO_DUMP_SKIP.get():
+        return
+
+    scores = getattr(tree, "node_scores", None)
+    if scores is not None:
+        # Always histogram the batch sizes we SEE, even when we do not record
+        # them. Without this, "every captured step was batch 1" is ambiguous
+        # between "the builder is per-request" and "we sampled the wrong window".
+        bs_seen = int(scores.shape[0])
+        _RHO_STATE["bs_hist"][bs_seen] = _RHO_STATE["bs_hist"].get(bs_seen, 0) + 1
+        # Report periodically, not only at write time: if the batch never reaches
+        # the threshold the dump never lands, and a silent probe teaches nothing.
+        if _RHO_STATE["seen"] % 500 == 0:
+            logger.warning(
+                "DFLASH_TFM rho dump: %d steps seen, %d recorded (min_bs=%d); "
+                "batch sizes seen: %s",
+                _RHO_STATE["seen"], len(_RHO_STATE["steps"]),
+                envs.SGLANG_DFLASH_TFM_RHO_DUMP_MIN_BS.get(),
+                sorted(_RHO_STATE["bs_hist"].items()),
+            )
+        if bs_seen < envs.SGLANG_DFLASH_TFM_RHO_DUMP_MIN_BS.get():
+            return
+    if scores is None:
+        _RHO_STATE["done"] = True
+        logger.warning(
+            "DFLASH_TFM rho dump: this builder does not produce node_scores; "
+            "nothing recorded."
+        )
+        return
+    _RHO_STATE["steps"].append(scores.detach().float().cpu().clone())
+    cap = envs.SGLANG_DFLASH_TFM_RHO_DUMP.get()
+    if len(_RHO_STATE["steps"]) >= cap:
+        _RHO_STATE["done"] = True
+        path = "/artifacts/rho_dump.pt"
+        try:
+            os.makedirs("/artifacts", exist_ok=True)
+            torch.save({"steps": _RHO_STATE["steps"]}, path)
+            logger.warning(
+                "DFLASH_TFM rho dump: wrote %d steps to %s (shapes %s..%s, "
+                "skipped %d; batch sizes seen: %s)",
+                len(_RHO_STATE["steps"]), path,
+                tuple(_RHO_STATE["steps"][0].shape),
+                tuple(_RHO_STATE["steps"][-1].shape),
+                envs.SGLANG_DFLASH_TFM_RHO_DUMP_SKIP.get(),
+                sorted(_RHO_STATE["bs_hist"].items()),
+            )
+        except Exception as exc:
+            logger.warning("DFLASH_TFM rho dump failed: %s", exc)
+
+
+def _dcut_report(scores: torch.Tensor, node_budget: int) -> None:
+    """Compare uniform per-request allocation against a batch-global top-N.
+
+    Reads `tree.node_scores` -- a CUDA-graph OUTPUT -- rather than a Python-side
+    accumulator. The old version appended inside the build loop, which the
+    graphed builder replays without ever running, so this probe emitted ZERO
+    lines across every run ever made and PARKED.md's ragged-verification gate was
+    never actually evaluable.
+    """
+    bs = scores.shape[0]
     total = bs * node_budget
     flat = scores.reshape(-1)
-    finite = int((flat > -float("inf")).sum())
+    finite = int(torch.isfinite(flat).sum())
     if finite == 0:
         return
     take = min(total, finite)
-    _, idx = torch.topk(flat, take)
+    _, idx = torch.topk(torch.nan_to_num(flat, neginf=-1e30), take)
     per_req = torch.bincount(idx // scores.shape[1], minlength=bs).float()
-    # marginal score = lowest selected score per request under the uniform split
-    marg = scores.masked_fill(scores == -float("inf"), float("inf")).min(dim=1).values
-    marg = marg[marg < float("inf")]
-    logger.info(
+    marg = scores.masked_fill(~torch.isfinite(scores), float("inf")).min(dim=1).values
+    marg = marg[torch.isfinite(marg)]
+    logger.warning(
         "DFLASH_TFM D-cut probe: bs=%d uniform=%d/req | global top-N per-req "
         "min=%.1f max=%.1f mean=%.1f std=%.2f | reallocated=%.1f%% | "
         "marginal score spread=%.3f (min %.3f max %.3f)",
@@ -2763,7 +3182,6 @@ def _dcut_report(bs: int, node_budget: int) -> None:
         float(marg.min()) if marg.numel() else 0.0,
         float(marg.max()) if marg.numel() else 0.0,
     )
-
 
 
 def _resolve_tree_budget(server_args) -> int:
@@ -3404,9 +3822,13 @@ class DFlashTfmWorker(DFlashWorkerV2):
             (bs, num_nodes), -torch.inf, dtype=torch.float32, device=device
         )
         is_sampled = torch.zeros((bs, num_nodes), dtype=torch.bool, device=device)
+        node_scores = torch.full(
+            (bs, num_nodes), -torch.inf, dtype=torch.float32, device=device
+        )
         tokens[:, 0] = root_ids
         node_mask[:, 0] = True
         draft_logprobs[:, 0] = 0.0
+        node_scores[:, 0] = 0.0
         empty_pool_ids = torch.zeros(
             (bs, num_nodes, pool_size), dtype=torch.long, device=device
         )
@@ -3416,7 +3838,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         if node_budget <= 0 or depth <= 0:
             return WeaverTree(
                 tokens, parents, depths, node_mask, draft_logprobs, is_sampled,
-                empty_pool_ids, empty_pool_ms,
+                empty_pool_ids, empty_pool_ms, node_scores,
             )
 
         batch_indices = torch.arange(bs, dtype=torch.long, device=device)
@@ -3591,6 +4013,12 @@ class DFlashTfmWorker(DFlashWorkerV2):
             torch.gather(c_lp[:, :written], 1, top_idx),
             torch.full_like(top_score, -torch.inf),
         )
+        # top_score is ALREADY the prefix score: child_score = b_score + top_lp is
+        # cumulative along the path, which is what makes DARTree's global top-B
+        # prefix-closed. So this is log rho directly, with no recomputation.
+        node_scores[:, 1 : 1 + take] = torch.where(
+            keep_mask, top_score, torch.full_like(top_score, -torch.inf)
+        )
         # Sample a few trees from REAL traffic. Reporting only the first tree
         # measured a server-warmup tree built on synthetic tokens, which is
         # identical across configurations and told us nothing about the beam.
@@ -3635,7 +4063,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
             )
         return WeaverTree(
             tokens, parents, depths, node_mask, draft_logprobs, is_sampled,
-            empty_pool_ids, empty_pool_ms,
+            empty_pool_ids, empty_pool_ms, node_scores,
         )
 
     def _build_tree_impl(
@@ -3663,9 +4091,13 @@ class DFlashTfmWorker(DFlashWorkerV2):
             (bs, num_nodes), -torch.inf, dtype=torch.float32, device=device
         )
         is_sampled = torch.zeros((bs, num_nodes), dtype=torch.bool, device=device)
+        node_scores = torch.full(
+            (bs, num_nodes), -torch.inf, dtype=torch.float32, device=device
+        )
         tokens[:, 0] = root_ids
         node_mask[:, 0] = True
         draft_logprobs[:, 0] = 0.0
+        node_scores[:, 0] = 0.0
         if node_budget <= 0 or depth <= 0:
             return WeaverTree(
                 tokens, parents, depths, node_mask, draft_logprobs, is_sampled,
@@ -3940,8 +4372,14 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 valid, node_depth, torch.zeros_like(node_depth)
             )
             node_mask[:, slot_slice] = valid
-            if _dcut_probe_active():
-                _dcut_record(node_score, valid)
+            # Graph-safe: slice assignment into a buffer allocated before capture,
+            # exactly like tokens/parents/depths above. This is what makes the
+            # prefix scores readable per step; the Python hook below cannot be,
+            # because the whole builder is replayed from a captured graph.
+            node_scores[:, slot_slice] = torch.where(
+                valid, node_score.float(),
+                torch.full_like(node_score, -torch.inf, dtype=torch.float32),
+            )
             draft_logprobs[:, slot_slice] = torch.where(
                 valid, node_logprob, torch.full_like(node_logprob, -torch.inf)
             )
@@ -3986,15 +4424,14 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 width,
             )
             slot_start = slot_stop
-        if _dcut_probe_active():
-            _DCUT_STATE["calls"] += 1
-            if _DCUT_STATE["calls"] in (200, 800, 2000):
-                _dcut_report(bs, node_budget)
-            else:
-                _DCUT_STATE["scores"] = []
+        # NOTE: both probes used to fire HERE, inside the build loop. The
+        # builder is CUDA-graphed, so this runs once per shape at capture and
+        # never per step -- which is why both emitted zero lines for their entire
+        # lifetime. They now read tree.node_scores from the dispatch site, after
+        # replay. Do not re-add a probe here.
         return WeaverTree(
             tokens, parents, depths, node_mask, draft_logprobs, is_sampled,
-            node_pool_ids, node_pool_ms,
+            node_pool_ids, node_pool_ms, node_scores,
         )
 
     def _build_chain_impl(
@@ -4556,7 +4993,7 @@ class DFlashTfmWorker(DFlashWorkerV2):
         # Both builders now go through the same capture path, so the comparison is
         # finally like-for-like. SGLANG_DFLASH_TFM_NO_TREE_GRAPH forces both eager.
         if root_ids.device.type == "cuda" and not envs.SGLANG_DFLASH_TFM_NO_TREE_GRAPH.get():
-            return self._build_tree_with_cuda_graph(
+            tree = self._build_tree_with_cuda_graph(
                 root_ids=root_ids,
                 output_norm=output_norm,
                 candidate_ids=candidate_ids,
@@ -4566,12 +5003,19 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 token_embed=token_embed,
                 greedy=greedy,
             )
+            # Record HERE, outside the graph. graph_state.tree holds static output
+            # buffers that replay() refreshes, so reading node_scores after the
+            # call gets this step's values. A hook inside the builder cannot work.
+            if _rho_dump_active():
+                _rho_dump_record(tree)
+            _dcut_maybe_report(tree)
+            return tree
         eager_builder = (
             self._build_tree_dartree_impl
             if envs.SGLANG_DFLASH_TFM_DARTREE.get()
             else self._build_tree_impl
         )
-        return eager_builder(
+        tree = eager_builder(
             root_ids=root_ids,
             output_norm=output_norm,
             candidate_ids=candidate_ids,
@@ -4581,6 +5025,10 @@ class DFlashTfmWorker(DFlashWorkerV2):
             token_embed=token_embed,
             greedy=greedy,
         )
+        if _rho_dump_active():
+            _rho_dump_record(tree)
+        _dcut_maybe_report(tree)
+        return tree
 
     def _prepare_for_speculative_decoding(
         self, batch: ScheduleBatch, draft_input: DFlashTfmDraftInput

@@ -2484,7 +2484,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
             univer_ok=self.univer_ok,
         )
         if _train_dump_active():
-            _train_attach_labels(predict, accept_index, bs)
+            _train_attach_labels(predict, accept_index, bs, target_probs)
         if envs.SGLANG_DFLASH_TFM_LOSSLESS_AUDIT.get():
             self._audit_losslessness(
                 target_probs, candidates, num_correct, predict, accept_index
@@ -3029,7 +3029,8 @@ def _train_note_slots(slots, depths) -> None:
     _TRAIN_STATE["slots"].append((slots, depths))
 
 
-def _train_attach_labels(predict, accept_index, bs: int) -> None:
+def _train_attach_labels(predict, accept_index, bs: int,
+                         target_probs=None) -> None:
     """Join each recorded expansion with the token the target emitted at its parent."""
     pools = _TRAIN_STATE["pools"]; slots = _TRAIN_STATE["slots"]
     _TRAIN_STATE["pools"] = []; _TRAIN_STATE["slots"] = []
@@ -3062,9 +3063,37 @@ def _train_attach_labels(predict, accept_index, bs: int) -> None:
             if not bool(keep.any()):
                 continue
             lab = flat[gidx][keep]
+            # UNBIASED SCORING against the target distribution.
+            #
+            # The label-based comparison is biased toward Weaver: on the accepted
+            # path a non-leaf node's label IS a child Weaver selected, so it lies
+            # inside Weaver's top-k BY CONSTRUCTION, while DFlash's column gets no
+            # such help. Scoring each ordering against p_target instead removes
+            # the bias, uses every node, and yields the target's own top-k mass --
+            # which is the LOSSLESS CEILING on per-node acceptance for a tree that
+            # verifies only k children.
+            pt = torch.zeros(int(keep.sum()), 9, dtype=torch.float32)
+            if target_probs is not None:
+                try:
+                    kb = b_of[keep].long()
+                    ks = sl.long()[keep]
+                    tp = target_probs[kb, ks, :].detach().float().cpu()   # [n, V]
+                    kid = ids[:rows][keep].long().clamp(min=0)
+                    ppool = tp.gather(1, kid)                            # [n, P]
+                    o_df = sc[:rows][keep].float().argsort(dim=1, descending=True)
+                    o_wv = lg[:rows][keep].float().argsort(dim=1, descending=True)
+                    col = 0
+                    for k in (1, 2, 7):
+                        pt[:, col] = tp.topk(k, dim=1).values.sum(1)      # target's own
+                        pt[:, col + 3] = ppool.gather(1, o_df[:, :k]).sum(1)
+                        pt[:, col + 6] = ppool.gather(1, o_wv[:, :k]).sum(1)
+                        col += 1
+                except Exception as exc:
+                    logger.warning("DFLASH_TFM train dump: p_target scoring "
+                                   "failed: %s", exc)
             _TRAIN_STATE["recs"].append(
                 (ids[:rows][keep], sc[:rows][keep], lg[:rows][keep], lab,
-                 dp.to(torch.int16)[keep]))
+                 dp.to(torch.int16)[keep], pt))
     except Exception as exc:
         logger.warning("DFLASH_TFM train dump: label join failed: %s", exc)
         return
@@ -3080,6 +3109,8 @@ def _train_attach_labels(predict, accept_index, bs: int) -> None:
                 "logits": torch.cat([r[2] for r in _TRAIN_STATE["recs"]]),
                 "label": torch.cat([r[3] for r in _TRAIN_STATE["recs"]]),
                 "depth": torch.cat([r[4] for r in _TRAIN_STATE["recs"]]),
+                # columns: [top1,top2,top7 | df1,df2,df7 | wv1,wv2,wv7]
+                "ptmass": torch.cat([r[5] for r in _TRAIN_STATE["recs"]]),
             }, path)
             logger.warning("DFLASH_TFM train dump: wrote %d rows to %s", n, path)
         except Exception as exc:

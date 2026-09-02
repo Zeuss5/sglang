@@ -2009,6 +2009,17 @@ def _traversal_verify_target_probs(
         dist = torch.where(
             (rv[:, None]) & (rs > 0), residual / rs.clamp_min(1e-20), dist
         )
+        # Defensive: top-k/top-p renormalisation can leave a row summing to zero
+        # (or carrying a NaN from upstream), and multinomial answers that with a
+        # device-side assert that kills the scheduler. Fall back to argmax on the
+        # unmodified target row, which is the right answer for a degenerate
+        # distribution and cannot crash.
+        dist = torch.nan_to_num(dist, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0)
+        bad = dist.sum(dim=-1) <= 0
+        if bool(bad.any()):
+            fallback = torch.zeros_like(dist)
+            fallback[bad, target_probs[row_ids, accept_leaf][bad].argmax(dim=-1)] = 1.0
+            dist = torch.where(bad[:, None], fallback, dist)
         bonus = torch.multinomial(dist, 1).squeeze(1)
         predict[row_ids * num_nodes + accept_leaf] = bonus.to(torch.int32)
         return predict, accept_index, num_correct, accept_leaf
@@ -2436,8 +2447,38 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
         expanded_temperature = torch.repeat_interleave(
             sampling_info.temperatures, self.draft_token_num, dim=0
         )
+        # A GREEDY request carries temperature 0 verbatim from sampling_params.
+        # This path runs whenever the batch is not ALL greedy, so one greedy
+        # request mixed among sampled ones divides by zero -> inf -> NaN, and the
+        # failure lands much later as a device-side assert inside multinomial
+        # ("probability tensor contains inf, nan or element < 0"). Higher
+        # concurrency just makes a mixed batch more likely, which is why this
+        # looked like a c64-only bug.
+        #
+        # Clamping is not merely safe here, it is CORRECT: softmax at T -> 0 is
+        # the argmax distribution, which is exactly the target distribution a
+        # greedy row should be verified against.
+        expanded_temperature = expanded_temperature.clamp_min(1e-5)
+        # SHAPE GUARD. `temperatures` is sized from sampling_info (the REAL batch)
+        # while next_token_logits comes from the target forward, which at
+        # concurrency runs a CUDA-graph-PADDED batch. When those disagree the
+        # division either broadcasts against the wrong rows or indexes past the
+        # logits, and the failure surfaces as an illegal memory access inside
+        # softmax -- reported asynchronously at whatever CUDA call comes next,
+        # which is why it looked like a FlashInfer fault. Fail here, in Python,
+        # with the numbers, instead.
+        _nl = logits_output.next_token_logits
+        if _nl.shape[0] != expanded_temperature.shape[0]:
+            raise RuntimeError(
+                "DFLASH_TFM verify shape mismatch: next_token_logits has "
+                f"{_nl.shape[0]} rows but temperatures expand to "
+                f"{expanded_temperature.shape[0]} "
+                f"(temperatures {tuple(sampling_info.temperatures.shape)}, "
+                f"draft_token_num {self.draft_token_num}, bs {bs}). "
+                "This is the padded-batch mismatch; slice to bs before verify."
+            )
         target_probs = F.softmax(
-            logits_output.next_token_logits / expanded_temperature, dim=-1
+            _nl / expanded_temperature, dim=-1
         )
         if getattr(sampling_info, "need_top_k_sampling", True):
             target_probs = top_k_renorm_prob(

@@ -267,8 +267,16 @@ class MambaAttnBackendBase(AttentionBackend):
             _pool = getattr(self.req_to_token_pool, "mamba_pool", None)
             _wp = getattr(_pool, "replayssm_write_pos", None) if _pool is not None else None
             if _wp is not None:
+                # Clamp BOTH ends. clamp(min=0) alone leaves an unguarded upper
+                # bound, and an index past the buffer is an out-of-bounds GPU
+                # gather -- an illegal memory access that surfaces asynchronously
+                # at whatever CUDA call happens next, which makes it very hard to
+                # attribute. Padded rows in a graph-captured batch are exactly
+                # where an out-of-range slot index comes from.
                 replayssm_write_pos = _wp[
-                    mamba_cache_indices.to(torch.long).clamp(min=0)
+                    mamba_cache_indices.to(torch.long).clamp(
+                        min=0, max=_wp.shape[0] - 1
+                    )
                 ].clone()
 
         return ForwardMetadata(

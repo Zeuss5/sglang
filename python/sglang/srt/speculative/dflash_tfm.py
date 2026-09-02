@@ -2078,6 +2078,8 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
     _rank_le = {2: 0, 4: 0, 8: 0, 16: 0, 64: 0}
     _promoted_yes = 0
     _promoted_no = 0
+    _child_in_tree = 0
+    _child_absent = 0
     _max_seen_depth = 1
     # 1024, not 4096: at c1 a step contributes ONE draft, so a 4096 threshold
     # needs more steps than a short benchmark runs and the histogram never prints.
@@ -2286,6 +2288,26 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                         r = rank[good].to(torch.float32)
                         DFlashTfmVerifyInput._rank_sum += float(r.sum().item())
                         DFlashTfmVerifyInput._rank_n += int(good.sum().item())
+                        # WAS THE CORRECT CHILD EVEN IN THE TREE? Splits the
+                        # post-selection loss into its two possible causes:
+                        # the verifier declined a child that was present (the
+                        # losslessness price, unrecoverable) versus the child
+                        # never reaching the tree (budget pruning, attackable).
+                        # Read together with promoted-but-failed: "in tree = 0 at
+                        # a first error" is partly definitional under membership
+                        # testing, so the content is the CONJUNCTION -- Weaver
+                        # ranked it top-7, and it still never reached the tree.
+                        par = self.parent_indices.view(bs_, -1)
+                        cand_all = self.draft_token.view(bs_, -1)
+                        kids = par == local[:, None]
+                        if self.node_mask is not None:
+                            kids = kids & self.node_mask.view(bs_, -1).bool()
+                        in_tree = ((cand_all == tgt[:, None]) & kids).any(dim=1)
+                        DFlashTfmVerifyInput._child_in_tree += int(
+                            (in_tree & errored).sum().item())
+                        DFlashTfmVerifyInput._child_absent += int(
+                            ((~in_tree) & errored).sum().item())
+
                         # DID WEAVER PROMOTE IT? pool_ms is the residual draft
                         # distribution, which the builder computes AFTER zeroing
                         # the deterministic children -- so ms == 0 at a pool
@@ -2351,6 +2373,8 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                         f" | weaver DEMOTED (fixable by re-rank):"
                         f" {DFlashTfmVerifyInput._promoted_no / max(DFlashTfmVerifyInput._promoted_no + DFlashTfmVerifyInput._promoted_yes, 1):.3f}"
                         f" promoted-but-failed: {DFlashTfmVerifyInput._promoted_yes / max(DFlashTfmVerifyInput._promoted_no + DFlashTfmVerifyInput._promoted_yes, 1):.3f}"
+                        f" | correct child IN TREE: {DFlashTfmVerifyInput._child_in_tree / max(DFlashTfmVerifyInput._child_in_tree + DFlashTfmVerifyInput._child_absent, 1):.3f}"
+                        f" ABSENT: {DFlashTfmVerifyInput._child_absent / max(DFlashTfmVerifyInput._child_in_tree + DFlashTfmVerifyInput._child_absent, 1):.3f}"
                         if pt else ""
                     )
                     DFlashTfmVerifyInput._pool_hit = 0
@@ -2362,6 +2386,8 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
                     DFlashTfmVerifyInput._rank_le = {2: 0, 4: 0, 8: 0, 16: 0, 64: 0}
                     DFlashTfmVerifyInput._promoted_yes = 0
                     DFlashTfmVerifyInput._promoted_no = 0
+                    DFlashTfmVerifyInput._child_in_tree = 0
+                    DFlashTfmVerifyInput._child_absent = 0
                     logger.warning(
                         "DFLASH_TFM first-error depth over %d drafts "
                         "[depth:frac(cumulative)]: %s | mean accepted %.3f%s",

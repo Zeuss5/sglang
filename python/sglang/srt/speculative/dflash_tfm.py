@@ -1715,7 +1715,7 @@ class Weaver(nn.Module):
         logits = candidate_scores.float() + residual
         logits = logits.masked_fill(candidate_ids < 0, -torch.inf)
         if _train_dump_active():
-            _train_capture_pool(candidate_ids, candidate_scores, logits)
+            _train_capture_pool(candidate_ids, candidate_scores, logits, query)
         return logits, torch.stack(current_key_layers), torch.stack(current_value_layers)
 
     def step_chain(
@@ -2996,7 +2996,7 @@ class DFlashTfmVerifyInput(DFlashVerifyInput):
 # SGLANG_DFLASH_TFM_DCUT_PROBE; off by default and free when off.
 _DCUT_STATE = {"calls": 0}
 _TRAIN_STATE = {"pools": [], "slots": [], "recs": [], "done": False,
-                "draft_token_num": 0}
+                "draft_token_num": 0, "head_saved": False}
 
 
 def _train_dump_active() -> bool:
@@ -3004,7 +3004,8 @@ def _train_dump_active() -> bool:
             and not _TRAIN_STATE["done"])
 
 
-def _train_capture_pool(candidate_ids, candidate_scores, logits) -> None:
+def _train_capture_pool(candidate_ids, candidate_scores, logits,
+                        query=None) -> None:
     """Append ONE expansion's candidate pool, pre- and post-Weaver.
 
     The depth-2+ question is whether the re-ranker improves on DFlash's own
@@ -3016,6 +3017,7 @@ def _train_capture_pool(candidate_ids, candidate_scores, logits) -> None:
         candidate_ids.detach().to("cpu", torch.int32).clone(),
         candidate_scores.detach().to("cpu", torch.float16).clone(),
         logits.detach().to("cpu", torch.float16).clone(),
+        None if query is None else query.detach().to("cpu", torch.float16).clone(),
     ))
 
 
@@ -3051,7 +3053,7 @@ def _train_attach_labels(predict, accept_index, bs: int,
     ai = ai[(ai >= 0) & (ai < flat.numel())]
     onpath[ai] = True
     try:
-        for (ids, sc, lg), (sl, dp) in zip(pools, slots):
+        for (ids, sc, lg, qy), (sl, dp) in zip(pools, slots):
             sl = sl.to("cpu").reshape(-1)              # [bs*width] tree slots
             dp = dp.to("cpu").reshape(-1)
             rows = sl.shape[0]
@@ -3073,6 +3075,8 @@ def _train_attach_labels(predict, accept_index, bs: int,
             # which is the LOSSLESS CEILING on per-node acceptance for a tree that
             # verifies only k children.
             pt = torch.zeros(int(keep.sum()), 9, dtype=torch.float32)
+            ptpool = torch.zeros(int(keep.sum()), ids.shape[1],
+                                 dtype=torch.float16)
             if target_probs is not None:
                 try:
                     kb = b_of[keep].long()
@@ -3082,6 +3086,7 @@ def _train_attach_labels(predict, accept_index, bs: int,
                     ppool = tp.gather(1, kid)                            # [n, P]
                     o_df = sc[:rows][keep].float().argsort(dim=1, descending=True)
                     o_wv = lg[:rows][keep].float().argsort(dim=1, descending=True)
+                    ptpool = ppool.to(torch.float16).clone()   # training target
                     col = 0
                     for k in (1, 2, 7):
                         pt[:, col] = tp.topk(k, dim=1).values.sum(1)      # target's own
@@ -3091,9 +3096,11 @@ def _train_attach_labels(predict, accept_index, bs: int,
                 except Exception as exc:
                     logger.warning("DFLASH_TFM train dump: p_target scoring "
                                    "failed: %s", exc)
+            if qy is None:
+                continue
             _TRAIN_STATE["recs"].append(
                 (ids[:rows][keep], sc[:rows][keep], lg[:rows][keep], lab,
-                 dp.to(torch.int16)[keep], pt))
+                 dp.to(torch.int16)[keep], pt, qy[:rows][keep], ptpool))
     except Exception as exc:
         logger.warning("DFLASH_TFM train dump: label join failed: %s", exc)
         return
@@ -3111,6 +3118,8 @@ def _train_attach_labels(predict, accept_index, bs: int,
                 "depth": torch.cat([r[4] for r in _TRAIN_STATE["recs"]]),
                 # columns: [top1,top2,top7 | df1,df2,df7 | wv1,wv2,wv7]
                 "ptmass": torch.cat([r[5] for r in _TRAIN_STATE["recs"]]),
+                "query": torch.cat([r[6] for r in _TRAIN_STATE["recs"]]),
+                "ptpool": torch.cat([r[7] for r in _TRAIN_STATE["recs"]]),
             }, path)
             logger.warning("DFLASH_TFM train dump: wrote %d rows to %s", n, path)
         except Exception as exc:
@@ -3491,6 +3500,23 @@ class DFlashTfmWorker(DFlashWorkerV2):
                 ).contiguous()
             self._weaver_residual_lm_head_cache_key = key
         assert self._weaver_residual_lm_head_cache is not None
+        # One-shot: persist the projected head for OFFLINE training. This single
+        # [vocab, d_rank] tensor is the whole of what a re-ranker needs from the
+        # target model -- candidate_weights is just residual_lm_head[ids] -- so
+        # dumping it here avoids reconstructing lm_head from safetensors shards.
+        if _train_dump_active() and not _TRAIN_STATE.get("head_saved"):
+            _TRAIN_STATE["head_saved"] = True
+            try:
+                os.makedirs("/artifacts", exist_ok=True)
+                torch.save(
+                    self._weaver_residual_lm_head_cache.detach().to(
+                        "cpu", torch.float16),
+                    "/artifacts/residual_lm_head.pt")
+                logger.warning(
+                    "DFLASH_TFM train dump: wrote residual_lm_head %s",
+                    tuple(self._weaver_residual_lm_head_cache.shape))
+            except Exception as exc:
+                logger.warning("DFLASH_TFM residual_lm_head dump failed: %s", exc)
         return self._weaver_residual_lm_head_cache
 
     def _topk_from_lm_head(
